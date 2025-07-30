@@ -188,6 +188,7 @@ struct BVH
 	// item bounds are not owned by the BVH but by the caller
     vec3* item_lowers;
 	vec3* item_uppers;
+	int* item_groups;
 	int num_items;
 
 	// cuda context
@@ -542,7 +543,7 @@ CUDA_CALLABLE void bvh_rem_descriptor(uint64_t id);
 
 #if !__CUDA_ARCH__
 
-void bvh_create_host(vec3* lowers, vec3* uppers, int num_items,  int constructor_type, BVH& bvh);
+void bvh_create_host(vec3* lowers, vec3* uppers, int num_items,  int constructor_type, int* groups, BVH& bvh);
 void bvh_destroy_host(wp::BVH& bvh);
 void bvh_refit_host(wp::BVH& bvh);
 

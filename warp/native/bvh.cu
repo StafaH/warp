@@ -34,7 +34,7 @@
 
 namespace wp
 {
-    void bvh_create_host(vec3* lowers, vec3* uppers, int num_items, int constructor_type, BVH& bvh);
+    void bvh_create_host(vec3* lowers, vec3* uppers, int num_items, int constructor_type, int* groups, BVH& bvh);
     void bvh_destroy_host(BVH& bvh);
 
 // for LBVH: this will start with some muted leaf nodes, but that is okay, we can still trace up because there parents information is still valid
@@ -173,7 +173,7 @@ public:
     ~LinearBVHBuilderGPU();
 
     // takes a bvh (host ref), and pointers to the GPU lower and upper bounds for each triangle
-    void build(BVH& bvh, const vec3* item_lowers, const vec3* item_uppers, int num_items, bounds3* total_bounds);
+    void build(BVH& bvh, const vec3* item_lowers, const vec3* item_uppers, int num_items, bounds3* total_bounds, int* item_groups);
 
 private:
 
@@ -488,7 +488,7 @@ LinearBVHBuilderGPU::~LinearBVHBuilderGPU()
 
 
 
-void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* item_uppers, int num_items, bounds3* total_bounds)
+void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* item_uppers, int num_items, bounds3* total_bounds, int* item_groups)
 {
     // allocate temporary memory used during  building
     indices = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*num_items*2); 	// *2 for radix sort
@@ -673,7 +673,7 @@ void copy_host_tree_to_device(void* context, BVH& bvh_host, BVH& bvh_device_on_h
 }
 
 // create in-place given existing descriptor
-void bvh_create_device(void* context, vec3* lowers, vec3* uppers, int num_items, int constructor_type, BVH& bvh_device_on_host)
+void bvh_create_device(void* context, vec3* lowers, vec3* uppers, int num_items, int constructor_type, int* groups, BVH& bvh_device_on_host)
 {
     ContextGuard guard(context);
     if (constructor_type == BVH_CONSTRUCTOR_SAH || constructor_type == BVH_CONSTRUCTOR_MEDIAN)
@@ -687,7 +687,7 @@ void bvh_create_device(void* context, vec3* lowers, vec3* uppers, int num_items,
 
         // run CPU based constructor
         wp::BVH bvh_host;
-        wp::bvh_create_host(lowers_host.data(), uppers_host.data(), num_items, constructor_type, bvh_host);
+        wp::bvh_create_host(lowers_host.data(), uppers_host.data(), num_items, constructor_type, groups, bvh_host);
 
         // copy host tree to device
         wp::copy_host_tree_to_device(WP_CURRENT_CONTEXT, bvh_host, bvh_device_on_host);
@@ -713,11 +713,12 @@ void bvh_create_device(void* context, vec3* lowers, vec3* uppers, int num_items,
         bvh_device_on_host.primitive_indices = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * num_items);
         bvh_device_on_host.item_lowers = lowers;
         bvh_device_on_host.item_uppers = uppers;
+        bvh_device_on_host.item_groups = groups;
 
         bvh_device_on_host.context = context ? context : wp_cuda_context_get_current();
 
         LinearBVHBuilderGPU builder;
-        builder.build(bvh_device_on_host, lowers, uppers, num_items, NULL);
+        builder.build(bvh_device_on_host, lowers, uppers, num_items, NULL, groups);
     }
     else
     {
@@ -759,13 +760,13 @@ void wp_bvh_refit_device(uint64_t id)
 * muted. However, the muted leaf nodes will still have the pointer to their parents, thus the up-tracing
 * can still work. We will only compute the bounding box of a leaf node if its parent is not a leaf node.
 */
-uint64_t wp_bvh_create_device(void* context, wp::vec3* lowers, wp::vec3* uppers, int num_items, int constructor_type)
+uint64_t wp_bvh_create_device(void* context, wp::vec3* lowers, wp::vec3* uppers, int num_items, int constructor_type, int* groups)
 {
     ContextGuard guard(context);
     wp::BVH bvh_device_on_host;
     wp::BVH* bvh_device_ptr = nullptr;
     
-    wp::bvh_create_device(WP_CURRENT_CONTEXT, lowers, uppers, num_items, constructor_type, bvh_device_on_host);
+    wp::bvh_create_device(WP_CURRENT_CONTEXT, lowers, uppers, num_items, constructor_type, groups, bvh_device_on_host);
 
     // create device-side BVH descriptor
     bvh_device_ptr = (wp::BVH*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(wp::BVH));
