@@ -179,7 +179,7 @@ private:
 
     // temporary data used during building
     int* indices;
-    int* keys;
+    uint64_t* keys;
     int* deltas;
     int* range_lefts;
     int* range_rights;
@@ -195,7 +195,7 @@ private:
 
 
 
-__global__ void compute_morton_codes(const vec3* __restrict__ item_lowers, const vec3* __restrict__ item_uppers, int n, const vec3* grid_lower, const vec3* grid_inv_edges, int* __restrict__ indices, int* __restrict__ keys)
+__global__ void compute_morton_codes(const vec3* __restrict__ item_lowers, const vec3* __restrict__ item_uppers, int n, const vec3* grid_lower, const vec3* grid_inv_edges, int* __restrict__ indices, uint64_t* __restrict__ keys, const int* __restrict__ item_groups)
 {
     const int index = blockDim.x*blockIdx.x + threadIdx.x;
 
@@ -209,7 +209,10 @@ __global__ void compute_morton_codes(const vec3* __restrict__ item_lowers, const
         vec3 local = cw_mul((center-grid_lower[0]), grid_inv_edges[0]);
         
         // 10-bit Morton codes stored in lower 30bits (1024^3 effective resolution)
-        int key = morton3<1024>(local[0], local[1], local[2]);
+        // Group stored in upper 32 bits
+        uint64_t morton_code = morton3<1024>(local[0], local[1], local[2]);
+        uint64_t group = item_groups ? item_groups[index] : 0;
+        uint64_t key = (group << 32) | morton_code;
 
         indices[index] = index;
         keys[index] = key;
@@ -217,18 +220,18 @@ __global__ void compute_morton_codes(const vec3* __restrict__ item_lowers, const
 }
 
 // calculate the index of the first differing bit between two adjacent Morton keys
-__global__ void compute_key_deltas(const int* __restrict__ keys, int* __restrict__ deltas, int n)
+__global__ void compute_key_deltas(const uint64_t* __restrict__ keys, int* __restrict__ deltas, int n)
 {
     const int index = blockDim.x*blockIdx.x + threadIdx.x;
 
     if (index < n)
     {
-        int a = keys[index];
-        int b = keys[index+1];
+        uint64_t a = keys[index];
+        uint64_t b = keys[index+1];
 
-        int x = a^b;
+        uint64_t x = a^b;
         
-        deltas[index] = x;// __clz(x);
+        deltas[index] = (int)x;// __clz(x);
     }
 }
 
@@ -492,7 +495,7 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
 {
     // allocate temporary memory used during  building
     indices = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*num_items*2); 	// *2 for radix sort
-    keys = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*num_items*2);	    // *2 for radix sort
+    keys = (uint64_t*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(uint64_t)*num_items*2);	    // *2 for radix sort
     deltas = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*num_items);    	// highest differentiating bit between keys for item i and i+1
     range_lefts = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*bvh.max_nodes);
     range_rights = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*bvh.max_nodes);
@@ -528,9 +531,9 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
     }
 
     // assign 30-bit Morton code based on the centroid of each triangle and bounds for each leaf
-    wp_launch_device(WP_CURRENT_CONTEXT, compute_morton_codes, num_items, (item_lowers, item_uppers, num_items, total_lower, total_inv_edges, indices, keys));
+    wp_launch_device(WP_CURRENT_CONTEXT, compute_morton_codes, num_items, (item_lowers, item_uppers, num_items, total_lower, total_inv_edges, indices, keys, item_groups));
     
-    // sort items based on Morton key (note the 32-bit sort key corresponds to the template parameter to morton3, i.e. 3x9 bit keys combined)
+    // sort items based on Morton key (note the 64-bit sort key includes group in upper 32 bits and morton code in lower 32 bits)
     radix_sort_pairs_device(WP_CURRENT_CONTEXT, keys, indices, num_items);
     wp_memcpy_d2d(WP_CURRENT_CONTEXT, bvh.primitive_indices, indices, sizeof(int) * num_items);
 
