@@ -447,12 +447,14 @@ void bvh_destroy_host(BVH& bvh)
     delete[] bvh.node_uppers;
     delete[] bvh.node_parents;
     delete[] bvh.primitive_indices;
+    delete[] bvh.keys;
     delete[] bvh.root;
 
     bvh.node_lowers = NULL;
     bvh.node_uppers = NULL;
     bvh.node_parents = NULL;
     bvh.primitive_indices = NULL;
+    bvh.keys = NULL;
     bvh.root = NULL;
 
     bvh.max_nodes = 0;

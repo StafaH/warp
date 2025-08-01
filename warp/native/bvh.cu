@@ -228,10 +228,11 @@ __global__ void compute_key_deltas(const uint64_t* __restrict__ keys, int* __res
     {
         uint64_t a = keys[index];
         uint64_t b = keys[index+1];
-
         uint64_t x = a^b;
-        
-        deltas[index] = (int)x;// __clz(x);
+        deltas[index] = (int)x;
+        // uint64_t diff = keys[index] ^ keys[index+1];
+        // int cpl = diff ? __clzll(diff) : 64;
+        // deltas[index] = cpl;
     }
 }
 
@@ -536,9 +537,11 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
     // sort items based on Morton key (note the 64-bit sort key includes group in upper 32 bits and morton code in lower 32 bits)
     radix_sort_pairs_device(WP_CURRENT_CONTEXT, keys, indices, num_items);
     wp_memcpy_d2d(WP_CURRENT_CONTEXT, bvh.primitive_indices, indices, sizeof(int) * num_items);
-
+    
     // calculate deltas between adjacent keys
     wp_launch_device(WP_CURRENT_CONTEXT, compute_key_deltas, num_items, (keys, deltas, num_items-1));
+    
+    wp_memcpy_d2d(WP_CURRENT_CONTEXT, bvh.keys, keys, sizeof(uint64_t) * num_items);
 
     // initialize leaf nodes
     wp_launch_device(WP_CURRENT_CONTEXT, build_leaves, num_items, (item_lowers, item_uppers, num_items, indices, range_lefts, range_rights, bvh.node_lowers, bvh.node_uppers));
@@ -673,6 +676,7 @@ void copy_host_tree_to_device(void* context, BVH& bvh_host, BVH& bvh_device_on_h
     bvh_device_on_host.node_uppers = make_device_buffer_of(context, bvh_host.node_uppers, bvh_host.max_nodes);
     bvh_device_on_host.node_parents = make_device_buffer_of(context, bvh_host.node_parents, bvh_host.max_nodes);
     bvh_device_on_host.primitive_indices = make_device_buffer_of(context, bvh_host.primitive_indices, bvh_host.num_items);
+    bvh_device_on_host.keys = make_device_buffer_of(context, bvh_host.keys, bvh_host.num_items);
 }
 
 // create in-place given existing descriptor
@@ -714,6 +718,7 @@ void bvh_create_device(void* context, vec3* lowers, vec3* uppers, int num_items,
         bvh_device_on_host.node_counts = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * bvh_device_on_host.max_nodes);
         bvh_device_on_host.root = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int));
         bvh_device_on_host.primitive_indices = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * num_items);
+        bvh_device_on_host.keys = (uint64_t*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(uint64_t) * num_items);
         bvh_device_on_host.item_lowers = lowers;
         bvh_device_on_host.item_uppers = uppers;
         bvh_device_on_host.item_groups = groups;
@@ -738,6 +743,7 @@ void bvh_destroy_device(BVH& bvh)
     wp_free_device(WP_CURRENT_CONTEXT, bvh.node_parents); bvh.node_parents = NULL;
     wp_free_device(WP_CURRENT_CONTEXT, bvh.node_counts); bvh.node_counts = NULL;
     wp_free_device(WP_CURRENT_CONTEXT, bvh.primitive_indices); bvh.primitive_indices = NULL;
+    wp_free_device(WP_CURRENT_CONTEXT, bvh.keys); bvh.keys = NULL;
     wp_free_device(WP_CURRENT_CONTEXT, bvh.root); bvh.root = NULL;
 }
 

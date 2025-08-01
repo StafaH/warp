@@ -4109,6 +4109,7 @@ class Bvh:
                 len(lowers),
                 bvh_constructor_values[constructor],
                 get_data(groups),
+                int(np.max(groups.numpy()) + 1) if groups else 0,
             )
 
     def __del__(self):
