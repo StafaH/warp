@@ -548,7 +548,7 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
     }
     else
     {
-        // IEEE-754 bit patterns for ±FLT_MAX
+        // IEEE-754 bit patterns for ï¿½FLT_MAX
         constexpr int FLT_MAX_BITS = 0x7f7fffff;
         constexpr int NEG_FLT_MAX_BITS = 0xff7fffff;
 
@@ -795,7 +795,7 @@ void bvh_rebuild_device(BVH& bvh)
     ContextGuard guard(bvh.context);
 
     LinearBVHBuilderGPU builder;
-    builder.build(bvh, bvh.item_lowers, bvh.item_uppers, bvh.num_items, NULL);
+    builder.build(bvh, bvh.item_lowers, bvh.item_uppers, bvh.num_items, NULL, bvh.item_groups);
 }
 
 
