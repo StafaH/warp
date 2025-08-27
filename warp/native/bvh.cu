@@ -757,6 +757,12 @@ void bvh_create_device(void* context, vec3* lowers, vec3* uppers, int num_items,
         bvh_device_on_host.item_uppers = uppers;
         bvh_device_on_host.item_groups = groups;
 
+#if WP_ENABLE_QBVH
+        bvh_device_on_host.qnodes = nullptr;
+        bvh_device_on_host.qnum_nodes = 0;
+        bvh_device_on_host.flags = 0u;
+#endif
+
         bvh_device_on_host.context = context ? context : wp_cuda_context_get_current();
 
         LinearBVHBuilderGPU builder;
@@ -779,6 +785,9 @@ void bvh_destroy_device(BVH& bvh)
     wp_free_device(WP_CURRENT_CONTEXT, bvh.primitive_indices); bvh.primitive_indices = NULL;
     wp_free_device(WP_CURRENT_CONTEXT, bvh.keys); bvh.keys = NULL;
     wp_free_device(WP_CURRENT_CONTEXT, bvh.root); bvh.root = NULL;
+#if WP_ENABLE_QBVH
+    wp_free_device(WP_CURRENT_CONTEXT, bvh.qnodes); bvh.qnodes = NULL;
+#endif
 }
 
 void bvh_refit_device(BVH& bvh)

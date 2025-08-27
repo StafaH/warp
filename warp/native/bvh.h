@@ -24,6 +24,7 @@
 #define SAH_NUM_BUCKETS (16)
 #define USE_LOAD4
 #define BVH_QUERY_STACK_SIZE (32)
+#define WP_ENABLE_QBVH 1
 
 #define BVH_CONSTRUCTOR_SAH (0)
 #define BVH_CONSTRUCTOR_MEDIAN (1)
@@ -163,6 +164,8 @@ struct BVHPackedNodeHalf
 	unsigned int b : 1;
 };
 
+struct QBVHNode; // forward declaration
+
 struct BVH
 {		
     BVHPackedNodeHalf* node_lowers;
@@ -196,7 +199,17 @@ struct BVH
 
 	// cuda context
 	void* context;
+    
+	// optional widened/quantized nodes
+	QBVHNode* qnodes;
+	int qnum_nodes;
+	unsigned flags;
 };
+
+CUDA_CALLABLE inline bool bvh_has_qbvh(const BVH& b)
+{
+	return (b.flags & 1u) && b.qnodes && b.qnum_nodes > 0;
+}
 
 CUDA_CALLABLE inline BVHPackedNodeHalf make_node(const vec3& bound, int child, bool leaf)
 {

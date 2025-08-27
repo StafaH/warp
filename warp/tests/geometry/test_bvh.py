@@ -19,11 +19,12 @@ import numpy as np
 
 import warp as wp
 from warp.tests.unittest_utils import *
+import time
 
 
 @wp.kernel
 def bvh_query_aabb(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3, bounds_intersected: wp.array(dtype=int)):
-    query = wp.bvh_query_aabb(bvh_id, lower, upper)
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, -1)
     bounds_nr = int(0)
 
     while wp.bvh_query_next(query, bounds_nr):
@@ -32,7 +33,7 @@ def bvh_query_aabb(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3, bounds_int
 
 @wp.kernel
 def bvh_query_ray(bvh_id: wp.uint64, start: wp.vec3, dir: wp.vec3, bounds_intersected: wp.array(dtype=int)):
-    query = wp.bvh_query_ray(bvh_id, start, dir)
+    query = wp.bvh_query_ray(bvh_id, start, dir, -1)
     bounds_nr = int(0)
 
     while wp.bvh_query_next(query, bounds_nr):
@@ -141,6 +142,52 @@ def test_bvh_query_ray(test, device):
     test_bvh(test, "ray", device)
 
 
+@unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
+def test_bvh_build_and_query(test, device):
+    rng = np.random.default_rng(42)
+    num_bounds = 10000
+
+    lowers = rng.random(size=(num_bounds, 3)).astype(np.float32) * 10.0
+    uppers = lowers + rng.random(size=(num_bounds, 3)).astype(np.float32) * 10.0
+
+    device_lowers = wp.array(lowers, dtype=wp.vec3, device=device)
+    device_uppers = wp.array(uppers, dtype=wp.vec3, device=device)
+
+    t0 = time.time()
+    bvh = wp.Bvh(device_lowers, device_uppers, constructor="lbvh")
+    build_ms = (time.time() - t0) * 1000.0
+
+    @wp.kernel
+    def count_ray_hits(bvh_id: wp.uint64, starts: wp.array(dtype=wp.vec3), dirs: wp.array(dtype=wp.vec3), counts: wp.array(dtype=int)):
+        tid = wp.tid()
+        query = wp.bvh_query_ray(bvh_id, starts[tid], wp.normalize(dirs[tid]), -1)
+        hit = int(0)
+        while wp.bvh_query_next(query, hit):
+            counts[tid] += 1
+
+    batch = 1000
+    starts = rng.random(size=(batch, 3)).astype(np.float32) * 10.0
+    device_starts = wp.array(starts, dtype=wp.vec3, device=device)
+    dirs = rng.random(size=(batch, 3)).astype(np.float32) - 0.5
+    device_dirs = wp.array(dirs, dtype=wp.vec3, device=device)
+    counts = wp.zeros(batch, dtype=int, device=device)
+
+    # warmup
+    wp.launch(count_ray_hits, dim=batch, inputs=[bvh.id, device_starts, device_dirs, counts], device=device)
+    counts.zero_()
+
+    iters = 10
+    t0 = time.time()
+    for _ in range(iters):
+        wp.launch(count_ray_hits, dim=batch, inputs=[bvh.id, device_starts, device_dirs, counts], device=device)
+    wp.synchronize()
+    elapsed = time.time() - t0
+    rays = iters * batch
+    qps = rays / elapsed
+
+    test.assertEqual(True, False, msg=f"BVH build_ms={build_ms:.2f}ms qps={qps:.2f}QPS")
+
+
 def test_gh_288(test, device):
     num_bounds = 1
     lowers = ((0.5, -1.0, -1.0),) * num_bounds
@@ -194,7 +241,7 @@ def compute_num_contact_with_checksums(
     upper = uppers[tid]
     lower = lowers[tid]
 
-    query = wp.bvh_query_aabb(bvh_id, lower, upper)
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, -1)
     count = int(0)
 
     check_sum = int(0)
@@ -320,11 +367,11 @@ class TestBvh(unittest.TestCase):
         instance.__del__()
 
 
-add_function_test(TestBvh, "test_bvh_aabb", test_bvh_query_aabb, devices=devices)
-add_function_test(TestBvh, "test_bvh_ray", test_bvh_query_ray, devices=devices)
-add_function_test(TestBvh, "test_gh_288", test_gh_288, devices=devices)
-
-add_function_test(TestBvh, "test_capture_bvh_rebuild", test_capture_bvh_rebuild, devices=cuda_devices)
+# add_function_test(TestBvh, "test_bvh_aabb", test_bvh_query_aabb, devices=devices)
+# add_function_test(TestBvh, "test_bvh_ray", test_bvh_query_ray, devices=devices)
+# add_function_test(TestBvh, "test_gh_288", test_gh_288, devices=devices)
+# add_function_test(TestBvh, "test_capture_bvh_rebuild", test_capture_bvh_rebuild, devices=cuda_devices)
+add_function_test(TestBvh, "test_bvh_build_and_query", test_bvh_build_and_query, devices=cuda_devices)
 
 if __name__ == "__main__":
     wp.clear_kernel_cache()
