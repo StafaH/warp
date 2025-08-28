@@ -451,6 +451,135 @@ __global__ void mark_packed_leaf_nodes(int n,
 }
 
 
+struct WidenTask 
+{
+    uint32_t lbvh_node;
+    uint32_t qbvh_node;
+};
+
+__global__ void bvh_widen_from_lbvh(const BVHPackedNodeHalf* __restrict__ lowers,
+                                    const BVHPackedNodeHalf* __restrict__ uppers,
+                                    const int* __restrict__ root,
+                                    int max_nodes,
+                                    QBVHNode* __restrict__ out_qnodes,
+                                    int* __restrict__ out_qcount)
+{
+    // One block per world/root is ideal; start simple: block 0 widens entire tree with a small stack.
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+    const int lbvh_root = *root;
+    if (lbvh_root < 0) { *out_qcount = 0; return; }
+
+    // Work stack (DFS)
+    const int    kMaxWork = 256;
+    WidenTask    stack[kMaxWork];
+    int          sp = 0;
+
+    // Create QBVH root at 0
+    int qcount = 1;
+    out_qnodes[0] = QBVHNode{};
+    stack[sp++] = { (uint32_t)lbvh_root, 0u };
+
+
+    while (sp > 0) {
+        const WidenTask task = stack[--sp];
+        const uint32_t lbvh_idx = task.lbvh_node;
+        const uint32_t qbvh_idx = task.qbvh_node;
+
+        // Build child set by expanding internal LBVH nodes until we have up to W children.
+        uint32_t queue[WP_BVH_QBVH_WIDTH];
+        int qsz = 0;
+        queue[qsz++] = lbvh_idx;
+
+        for (;;) {
+            if (qsz >= WP_BVH_QBVH_WIDTH) break;
+
+            // Find an internal node in the queue to expand
+            int internal_pos = -1;
+            for (int i = 0; i < qsz; ++i) {
+                if (!lowers[queue[i]].b) { internal_pos = i; break; }
+            }
+            if (internal_pos < 0) break; // all queued nodes are leaves
+
+            // Remove that internal node and push its two children
+            const uint32_t n = queue[internal_pos];
+            queue[internal_pos] = queue[--qsz];        // remove by swapping with last
+            const uint32_t left  = (uint32_t)lowers[n].i;
+            const uint32_t right = (uint32_t)uppers[n].i;
+
+            // Push children (bounded by capacity W)
+            queue[qsz++] = left;
+            if (qsz < WP_BVH_QBVH_WIDTH) {
+                queue[qsz++] = right;
+            } else {
+                break;
+            }
+        }
+
+        const int nchild = qsz; // <= W
+
+        // Compute quant domain over current children
+        float minx =  FLT_MAX, miny =  FLT_MAX, minz =  FLT_MAX;
+        float maxx = -FLT_MAX, maxy = -FLT_MAX, maxz = -FLT_MAX;
+        for (int i = 0; i < nchild; ++i) {
+            const BVHPackedNodeHalf cL = lowers[queue[i]];
+            const BVHPackedNodeHalf cU = uppers[queue[i]];
+            minx = fminf(minx, cL.x);  miny = fminf(miny, cL.y);  minz = fminf(minz, cL.z);
+            maxx = fmaxf(maxx, cU.x);  maxy = fmaxf(maxy, cU.y);  maxz = fmaxf(maxz, cU.z);
+        }
+
+        const float ex = fmaxf(maxx - minx, 1e-6f);
+        const float ey = fmaxf(maxy - miny, 1e-6f);
+        const float ez = fmaxf(maxz - minz, 1e-6f);
+
+        QBVHNode n{}; // zero-init
+        n.num_children = (uint8_t)nchild;
+        n.min_point = vec3f(minx, miny, minz);
+        n.inv_scale = vec3f(255.f / ex, 255.f / ey, 255.f / ez);
+
+        // Fill children
+        for (int i = 0; i < nchild; ++i) {
+            const uint32_t c = queue[i];
+            const BVHPackedNodeHalf cL = lowers[c];
+            const BVHPackedNodeHalf cU = uppers[c];
+
+            // Quantize
+            const float qminx = (cL.x - minx) * n.inv_scale[0];
+            const float qminy = (cL.y - miny) * n.inv_scale[1];
+            const float qminz = (cL.z - minz) * n.inv_scale[2];
+            const float qmaxx = (cU.x - minx) * n.inv_scale[0];
+            const float qmaxy = (cU.y - miny) * n.inv_scale[1];
+            const float qmaxz = (cU.z - minz) * n.inv_scale[2];
+
+            n.qminx[i] = (uint8_t)fminf(fmaxf(qminx, 0.f), 255.f);
+            n.qminy[i] = (uint8_t)fminf(fmaxf(qminy, 0.f), 255.f);
+            n.qminz[i] = (uint8_t)fminf(fmaxf(qminz, 0.f), 255.f);
+            n.qmaxx[i] = (uint8_t)fminf(fmaxf(qmaxx, 0.f), 255.f);
+            n.qmaxy[i] = (uint8_t)fminf(fmaxf(qmaxy, 0.f), 255.f);
+            n.qmaxz[i] = (uint8_t)fminf(fmaxf(qmaxz, 0.f), 255.f);
+
+            if (cL.b) {
+                // LBVH leaf → sentinel
+                n.children_idx[i] = qbvh_leaf_node(c);
+            } else {
+                // LBVH internal → allocate and push
+                if (qcount >= max_nodes) { *out_qcount = qcount; return; }
+                const uint32_t new_q = (uint32_t)qcount++;
+                n.children_idx[i] = new_q;
+                out_qnodes[new_q] = QBVHNode{}; // keep clean
+                if (sp < kMaxWork) {
+                    stack[sp++] = WidenTask{ c, new_q };
+                }
+            }
+        }
+
+        out_qnodes[qbvh_idx] = n;
+    }
+
+    *out_qcount = qcount;
+}
+
+
 CUDA_CALLABLE inline vec3 Vec3Max(const vec3& a, const vec3& b) { return wp::max(a, b); }
 CUDA_CALLABLE inline vec3 Vec3Min(const vec3& a, const vec3& b) { return wp::min(a, b); }
 
@@ -585,8 +714,17 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
 
     // build the tree and internal node bounds
     wp_launch_device(WP_CURRENT_CONTEXT, build_hierarchy, num_items, (num_items, bvh.root, deltas, bvh.keys, num_children, bvh.primitive_indices, range_lefts, range_rights, bvh.node_parents, bvh.node_lowers, bvh.node_uppers));
-    wp_launch_device(WP_CURRENT_CONTEXT, mark_packed_leaf_nodes, bvh.max_nodes, (bvh.max_nodes, range_lefts, range_rights, bvh.node_parents, bvh.keys, bvh.node_lowers, bvh.node_uppers));
+    // wp_launch_device(WP_CURRENT_CONTEXT, mark_packed_leaf_nodes, bvh.max_nodes, (bvh.max_nodes, range_lefts, range_rights, bvh.node_parents, bvh.keys, bvh.node_lowers, bvh.node_uppers));
 
+    // widen from LBVH to QBVH
+    int* qcount_dev = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int));
+    wp_memset_device(WP_CURRENT_CONTEXT, qcount_dev, 0, sizeof(int));
+    wp_launch_device(WP_CURRENT_CONTEXT, bvh_widen_from_lbvh, 1, (bvh.node_lowers, bvh.node_uppers, bvh.root, bvh.max_nodes, bvh.qnodes, qcount_dev));
+    wp_memcpy_d2h(WP_CURRENT_CONTEXT, &bvh.qnum_nodes, qcount_dev, sizeof(int));
+    wp_free_device(WP_CURRENT_CONTEXT, qcount_dev);
+    bvh.flags |= 1u; // has_qbvh
+
+    
     // free temporary memory
     wp_free_device(WP_CURRENT_CONTEXT, indices);
     wp_free_device(WP_CURRENT_CONTEXT, keys);
@@ -711,6 +849,9 @@ void copy_host_tree_to_device(void* context, BVH& bvh_host, BVH& bvh_device_on_h
     bvh_device_on_host.node_parents = make_device_buffer_of(context, bvh_host.node_parents, bvh_host.max_nodes);
     bvh_device_on_host.primitive_indices = make_device_buffer_of(context, bvh_host.primitive_indices, bvh_host.num_items);
     bvh_device_on_host.keys = make_device_buffer_of(context, bvh_host.keys, bvh_host.num_items);
+    bvh_device_on_host.qnodes = make_device_buffer_of(context, bvh_host.qnodes, bvh_host.max_nodes);
+    bvh_device_on_host.qnum_nodes = bvh_host.qnum_nodes;
+    bvh_device_on_host.flags = bvh_host.flags;
 }
 
 // create in-place given existing descriptor
@@ -756,12 +897,9 @@ void bvh_create_device(void* context, vec3* lowers, vec3* uppers, int num_items,
         bvh_device_on_host.item_lowers = lowers;
         bvh_device_on_host.item_uppers = uppers;
         bvh_device_on_host.item_groups = groups;
-
-#if WP_ENABLE_QBVH
-        bvh_device_on_host.qnodes = nullptr;
+        bvh_device_on_host.qnodes = (QBVHNode*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(QBVHNode) * bvh_device_on_host.max_nodes);
         bvh_device_on_host.qnum_nodes = 0;
         bvh_device_on_host.flags = 0u;
-#endif
 
         bvh_device_on_host.context = context ? context : wp_cuda_context_get_current();
 
@@ -785,9 +923,7 @@ void bvh_destroy_device(BVH& bvh)
     wp_free_device(WP_CURRENT_CONTEXT, bvh.primitive_indices); bvh.primitive_indices = NULL;
     wp_free_device(WP_CURRENT_CONTEXT, bvh.keys); bvh.keys = NULL;
     wp_free_device(WP_CURRENT_CONTEXT, bvh.root); bvh.root = NULL;
-#if WP_ENABLE_QBVH
     wp_free_device(WP_CURRENT_CONTEXT, bvh.qnodes); bvh.qnodes = NULL;
-#endif
 }
 
 void bvh_refit_device(BVH& bvh)

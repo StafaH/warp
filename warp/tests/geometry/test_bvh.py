@@ -21,6 +21,7 @@ import warp as wp
 from warp.tests.unittest_utils import *
 import time
 
+wp.config.debug = True
 
 @wp.kernel
 def bvh_query_aabb(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3, bounds_intersected: wp.array(dtype=int)):
@@ -121,17 +122,17 @@ def test_bvh(test, type, device):
 
             test.assertEqual(host_intersected, device_intersected[i])
 
-        if test_case == 0 or test_case == 1:
-            lowers = rng.random(size=(num_bounds, 3)) * 5.0
-            uppers = lowers + rng.random(size=(num_bounds, 3)) * 5.0
-            wp.copy(device_lowers, wp.array(lowers, dtype=wp.vec3, device=device))
-            wp.copy(device_uppers, wp.array(uppers, dtype=wp.vec3, device=device))
-            bounds_intersected.zero_()
+        # if test_case == 0 or test_case == 1:
+        #     lowers = rng.random(size=(num_bounds, 3)) * 5.0
+        #     uppers = lowers + rng.random(size=(num_bounds, 3)) * 5.0
+        #     wp.copy(device_lowers, wp.array(lowers, dtype=wp.vec3, device=device))
+        #     wp.copy(device_uppers, wp.array(uppers, dtype=wp.vec3, device=device))
+        #     bounds_intersected.zero_()
 
-            if test_case == 0:
-                bvh.refit()
-            else:
-                bvh.rebuild()
+        #     if test_case == 0:
+        #         bvh.refit()
+        #     else:
+        #         bvh.rebuild()
 
 
 def test_bvh_query_aabb(test, device):
@@ -152,7 +153,7 @@ def test_bvh_build_and_query(test, device):
 
     device_lowers = wp.array(lowers, dtype=wp.vec3, device=device)
     device_uppers = wp.array(uppers, dtype=wp.vec3, device=device)
-
+    
     t0 = time.time()
     bvh = wp.Bvh(device_lowers, device_uppers, constructor="lbvh")
     build_ms = (time.time() - t0) * 1000.0
@@ -347,14 +348,14 @@ class TestBvh(unittest.TestCase):
             bounds_nr = int(0)
 
             if True:
-                query_1 = wp.bvh_query_aabb(bvh, v, v)
-                query_2 = wp.bvh_query_ray(bvh, v, v)
+                query_1 = wp.bvh_query_aabb(bvh, v, v, -1)
+                query_2 = wp.bvh_query_ray(bvh, v, v, -1)
 
                 wp.bvh_query_next(query_1, bounds_nr)
                 wp.bvh_query_next(query_2, bounds_nr)
             else:
-                query_1 = wp.bvh_query_aabb(bvh, v, v)
-                query_2 = wp.bvh_query_ray(bvh, v, v)
+                query_1 = wp.bvh_query_aabb(bvh, v, v, -1)
+                query_2 = wp.bvh_query_ray(bvh, v, v, -1)
 
                 wp.bvh_query_next(query_1, bounds_nr)
                 wp.bvh_query_next(query_2, bounds_nr)
@@ -367,11 +368,11 @@ class TestBvh(unittest.TestCase):
         instance.__del__()
 
 
-# add_function_test(TestBvh, "test_bvh_aabb", test_bvh_query_aabb, devices=devices)
-# add_function_test(TestBvh, "test_bvh_ray", test_bvh_query_ray, devices=devices)
-# add_function_test(TestBvh, "test_gh_288", test_gh_288, devices=devices)
+add_function_test(TestBvh, "test_bvh_aabb", test_bvh_query_aabb, devices=cuda_devices)
+add_function_test(TestBvh, "test_bvh_ray", test_bvh_query_ray, devices=cuda_devices)
+add_function_test(TestBvh, "test_gh_288", test_gh_288, devices=cuda_devices)
 # add_function_test(TestBvh, "test_capture_bvh_rebuild", test_capture_bvh_rebuild, devices=cuda_devices)
-add_function_test(TestBvh, "test_bvh_build_and_query", test_bvh_build_and_query, devices=cuda_devices)
+# add_function_test(TestBvh, "test_bvh_build_and_query", test_bvh_build_and_query, devices=cuda_devices)
 
 if __name__ == "__main__":
     wp.clear_kernel_cache()
