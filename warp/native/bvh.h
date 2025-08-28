@@ -214,7 +214,7 @@ struct BVH
 	// for bottom-up builders
 	int* root;
 	// pointer for the root of each group
-	int* group_roots;
+	// int* group_roots;
 
 	// item bounds are not owned by the BVH but by the caller
 	vec3* item_lowers;
@@ -229,6 +229,7 @@ struct BVH
 	QBVHNode* qnodes;
 	int qnum_nodes;
 	unsigned flags;
+	int* lbvh_to_qbvh;
 };
 
 CUDA_CALLABLE inline bool bvh_has_qbvh(const BVH& b)
@@ -498,7 +499,6 @@ CUDA_CALLABLE inline bvh_query_t bvh_query(
 	query.bvh = bvh;
 	query.is_ray = is_ray;
 
-	// store inputs
 	query.input_lower = lower;
 	query.input_upper = upper;
 	query.primitive_counter = 0;
@@ -506,56 +506,65 @@ CUDA_CALLABLE inline bvh_query_t bvh_query(
 	// Start traversal: use QBVH only for rays and when available; otherwise fall back to LBVH
 	if (is_ray && bvh_has_qbvh(bvh))
 	{
-		// QBVH root is 0 from widen
-		query.qstack[0] = NodeGroup{ (uint32_t)0, 0u };
-		query.qcount = 1;
-		query.count = 0; // LBVH stack empty; QBVH will enqueue LBVH leaves
+		const int lbvh_start = root == -1 ? *bvh.root : root;
+		int qstart = 0;
+		if (lbvh_start >= 0)
+		{
+			qstart = bvh.lbvh_to_qbvh[lbvh_start];
+		}
+		
+		if (qstart >= 0)
+		{
+			query.qstack[0] = NodeGroup{ (uint32_t)qstart, 0u };
+			query.qcount = 1;
+			query.count = 0; // LBVH stack empty; QBVH will enqueue LBVH leaves
+		}
+		else
+		{
+			// Fall back to LBVH if QBVH mapping failed
+			query.stack[0] = lbvh_start;
+			query.count = 1;
+		}
+		return query;
 	}
-	else
+
+	// optimization: make the latest	
+	query.stack[0] = root == -1 ? *bvh.root : root;
+	query.count = 1;
+	query.input_lower = lower;
+	query.input_upper = upper;
+
+	// Navigate through the bvh, find the first overlapping leaf node.
+	while (query.count)
 	{
-		query.qcount = 0;
-		query.stack[0] = root == -1 ? *bvh.root : root;
-		query.count = 1;
+		const int node_index = query.stack[--query.count];
+		BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
+		BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+
+		if (!bvh_query_intersection_test(query, (vec3&)node_lower, (vec3&)node_upper))
+		{
+			continue;
+		}
+
+		const int left_index = node_lower.i;
+		const int right_index = node_upper.i;
+		// Make bounds from this AABB
+		if (node_lower.b)
+		{
+			// Reached a leaf node, point to its first primitive
+			// Back up one level and return 
+			query.primitive_counter = 0;
+			query.stack[query.count++] = node_index;
+			return query;
+		}
+		else
+		{
+			query.stack[query.count++] = left_index;
+			query.stack[query.count++] = right_index;
+		}
 	}
+
 	return query;
-
-	// // optimization: make the latest	
-	// query.stack[0] = root == -1 ? *bvh.root : root;
-	// query.count = 1;
-	// query.input_lower = lower;
-	// query.input_upper = upper;
-
-	// // Navigate through the bvh, find the first overlapping leaf node.
-	// while (query.count)
-	// {
-	// 	const int node_index = query.stack[--query.count];
-	// 	BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
-	// 	BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
-
-	// 	if (!bvh_query_intersection_test(query, (vec3&)node_lower, (vec3&)node_upper))
-	// 	{
-	// 		continue;
-	// 	}
-
-	// 	const int left_index = node_lower.i;
-	// 	const int right_index = node_upper.i;
-	// 	// Make bounds from this AABB
-	// 	if (node_lower.b)
-	// 	{
-	// 		// Reached a leaf node, point to its first primitive
-	// 		// Back up one level and return 
-	// 		query.primitive_counter = 0;
-	// 		query.stack[query.count++] = node_index;
-	// 		return query;
-	// 	}
-	// 	else
-	// 	{
-	// 		query.stack[query.count++] = left_index;
-	// 		query.stack[query.count++] = right_index;
-	// 	}
-	// }
-
-	// return query;
 }
 
 CUDA_CALLABLE inline bvh_query_t bvh_query_aabb(
@@ -599,7 +608,8 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index)
 		const vec3 inv_d = query.input_upper;
 
 		while (query.qcount) {
-				NodeGroup g = query.qstack[--query.qcount];
+			NodeGroup g = query.qstack[--query.qcount];
+			if (g.qnode >= 0 && g.qnode < bvh.qnum_nodes) {
 				const QBVHNode& n = bvh.qnodes[g.qnode];
 
 				vec3 dirq, orgq;
@@ -608,33 +618,34 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index)
 				uint32_t present = g.mask ? g.mask : qbvh_present_mask(n, dirq, orgq, /*tmax=*/1e30f);
 				
 				while (present) {
-						int c = __ffs(present) - 1; // find first set bit
-						present &= (present - 1); // pop low bit
+					int c = __ffs(present) - 1; // find first set bit
+					present &= (present - 1); // pop low bit
 
-						uint32_t child = n.children_idx[c];
-						if (qbvh_is_leaf(child)) {
-								// LBVH leaf: push it on the LBVH stack to reuse your leaf scan logic
-								int lbvh_node = (int)qbvh_child_index(child);
-								if (query.count < BVH_QUERY_STACK_SIZE) {
-									query.primitive_counter = 0; // reset for new leaf
-									query.stack[query.count++] = lbvh_node;
-								}
-								// fall through to LBVH loop below for primitive scan
-						} else {
-							if (present && query.qcount < BVH_QUERY_STACK_SIZE) {
-								query.qstack[query.qcount++] = NodeGroup{ g.qnode, present };
-							}
-							if (query.qcount < BVH_QUERY_STACK_SIZE) {
-								query.qstack[query.qcount++] = NodeGroup{ child, 0u };
-							}
-							present = 0; // ensure we process child now
+					uint32_t child = n.children_idx[c];
+					if (qbvh_is_leaf(child)) {
+						// LBVH leaf: push it on the LBVH stack to reuse your leaf scan logic
+						int lbvh_node = (int)qbvh_child_index(child);
+						if (query.count < BVH_QUERY_STACK_SIZE) {
+							query.primitive_counter = 0; // reset for new leaf
+							query.stack[query.count++] = lbvh_node;
 						}
+						// fall through to LBVH loop below for primitive scan
+					} else {
+						if (present && query.qcount < BVH_QUERY_STACK_SIZE) {
+							query.qstack[query.qcount++] = NodeGroup{ g.qnode, present };
+						}
+						if (query.qcount < BVH_QUERY_STACK_SIZE) {
+							query.qstack[query.qcount++] = NodeGroup{ child, 0u };
+						}
+						present = 0; // ensure we process child now
+					}
 				}
 
 				// After consuming all present children of this QBVH node, continue while(qcount)
 				// The LBVH scan happens in the shared leaf loop below.
 				// break to LBVH only if LBVH stack is non-empty:
 				if (query.count) break;
+			}
 		}
 	}
 	// If QBVH exhausted, query.count might still have LBVH leafs enqueued

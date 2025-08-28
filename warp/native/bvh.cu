@@ -412,6 +412,7 @@ __global__ void mark_packed_leaf_nodes(int n,
     BVHPackedNodeHalf* __restrict__ uppers)
 {
     int node_index = blockDim.x * blockIdx.x + threadIdx.x;
+    
     if (node_index < n)
     {
         // mark the node as leaf if its range is less than LEAF_SIZE_LBVH or it is deeper than BVH_QUERY_STACK_SIZE
@@ -434,12 +435,9 @@ __global__ void mark_packed_leaf_nodes(int n,
 
         // avoid creating packed leaves that straddle group boundaries
         bool single_group = true;
-        if (keys)
-        {
-            const uint64_t group_left = keys[left] >> 32;
-            const uint64_t group_right = keys[right - 1] >> 32;
-            single_group = (group_left == group_right);
-        }
+        const uint64_t group_left = keys[left] >> 32;
+        const uint64_t group_right = keys[right - 1] >> 32;
+        single_group = (group_left == group_right);
 
         if (single_group && (right - left <= BVH_LEAF_SIZE || depth >= BVH_QUERY_STACK_SIZE))
         {
@@ -451,7 +449,7 @@ __global__ void mark_packed_leaf_nodes(int n,
 }
 
 
-struct WidenTask 
+struct WidenTask
 {
     uint32_t lbvh_node;
     uint32_t qbvh_node;
@@ -462,13 +460,13 @@ __global__ void bvh_widen_from_lbvh(const BVHPackedNodeHalf* __restrict__ lowers
                                     const int* __restrict__ root,
                                     int max_nodes,
                                     QBVHNode* __restrict__ out_qnodes,
-                                    int* __restrict__ out_qcount)
+                                    int* __restrict__ out_qcount,
+                                    int* __restrict__ lbvh_to_qbvh)
 {
     // One block per world/root is ideal; start simple: block 0 widens entire tree with a small stack.
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
 
     const int lbvh_root = *root;
-    if (lbvh_root < 0) { *out_qcount = 0; return; }
 
     // Work stack (DFS)
     const int    kMaxWork = 256;
@@ -478,8 +476,9 @@ __global__ void bvh_widen_from_lbvh(const BVHPackedNodeHalf* __restrict__ lowers
     // Create QBVH root at 0
     int qcount = 1;
     out_qnodes[0] = QBVHNode{};
+    lbvh_to_qbvh[0] = 0;
+    
     stack[sp++] = { (uint32_t)lbvh_root, 0u };
-
 
     while (sp > 0) {
         const WidenTask task = stack[--sp];
@@ -492,7 +491,7 @@ __global__ void bvh_widen_from_lbvh(const BVHPackedNodeHalf* __restrict__ lowers
         queue[qsz++] = lbvh_idx;
 
         for (;;) {
-            if (qsz >= WP_BVH_QBVH_WIDTH) break;
+            if (qsz + 1 >= WP_BVH_QBVH_WIDTH) break; // Need room for two children
 
             // Find an internal node in the queue to expand
             int internal_pos = -1;
@@ -558,18 +557,15 @@ __global__ void bvh_widen_from_lbvh(const BVHPackedNodeHalf* __restrict__ lowers
             n.qmaxy[i] = (uint8_t)fminf(fmaxf(qmaxy, 0.f), 255.f);
             n.qmaxz[i] = (uint8_t)fminf(fmaxf(qmaxz, 0.f), 255.f);
 
-            if (cL.b) {
-                // LBVH leaf → sentinel
+            if (cL.b) { // LBVH leaf → sentinel
                 n.children_idx[i] = qbvh_leaf_node(c);
-            } else {
-                // LBVH internal → allocate and push
+            } else { // LBVH internal → allocate and push
                 if (qcount >= max_nodes) { *out_qcount = qcount; return; }
                 const uint32_t new_q = (uint32_t)qcount++;
                 n.children_idx[i] = new_q;
-                out_qnodes[new_q] = QBVHNode{}; // keep clean
-                if (sp < kMaxWork) {
-                    stack[sp++] = WidenTask{ c, new_q };
-                }
+                out_qnodes[new_q] = QBVHNode{};
+                lbvh_to_qbvh[c] = new_q;
+                stack[sp++] = WidenTask{ c, new_q };
             }
         }
 
@@ -714,12 +710,25 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
 
     // build the tree and internal node bounds
     wp_launch_device(WP_CURRENT_CONTEXT, build_hierarchy, num_items, (num_items, bvh.root, deltas, bvh.keys, num_children, bvh.primitive_indices, range_lefts, range_rights, bvh.node_parents, bvh.node_lowers, bvh.node_uppers));
-    // wp_launch_device(WP_CURRENT_CONTEXT, mark_packed_leaf_nodes, bvh.max_nodes, (bvh.max_nodes, range_lefts, range_rights, bvh.node_parents, bvh.keys, bvh.node_lowers, bvh.node_uppers));
+    wp_launch_device(WP_CURRENT_CONTEXT, mark_packed_leaf_nodes, bvh.max_nodes, (bvh.max_nodes, range_lefts, range_rights, bvh.node_parents, bvh.keys, bvh.node_lowers, bvh.node_uppers));
 
     // widen from LBVH to QBVH
     int* qcount_dev = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int));
     wp_memset_device(WP_CURRENT_CONTEXT, qcount_dev, 0, sizeof(int));
-    wp_launch_device(WP_CURRENT_CONTEXT, bvh_widen_from_lbvh, 1, (bvh.node_lowers, bvh.node_uppers, bvh.root, bvh.max_nodes, bvh.qnodes, qcount_dev));
+    
+    wp_launch_device(
+        WP_CURRENT_CONTEXT,
+        bvh_widen_from_lbvh,
+        1,
+        (
+            bvh.node_lowers,
+            bvh.node_uppers,
+            bvh.root,
+            bvh.max_nodes,
+            bvh.qnodes,
+            qcount_dev,
+            bvh.lbvh_to_qbvh)
+    );
     wp_memcpy_d2h(WP_CURRENT_CONTEXT, &bvh.qnum_nodes, qcount_dev, sizeof(int));
     wp_free_device(WP_CURRENT_CONTEXT, qcount_dev);
     bvh.flags |= 1u; // has_qbvh
@@ -849,9 +858,28 @@ void copy_host_tree_to_device(void* context, BVH& bvh_host, BVH& bvh_device_on_h
     bvh_device_on_host.node_parents = make_device_buffer_of(context, bvh_host.node_parents, bvh_host.max_nodes);
     bvh_device_on_host.primitive_indices = make_device_buffer_of(context, bvh_host.primitive_indices, bvh_host.num_items);
     bvh_device_on_host.keys = make_device_buffer_of(context, bvh_host.keys, bvh_host.num_items);
-    bvh_device_on_host.qnodes = make_device_buffer_of(context, bvh_host.qnodes, bvh_host.max_nodes);
-    bvh_device_on_host.qnum_nodes = bvh_host.qnum_nodes;
-    bvh_device_on_host.flags = bvh_host.flags;
+    // Copy optional QBVH data only if present/valid on host
+    if (bvh_host.qnodes && (bvh_host.flags & 1u) && bvh_host.qnum_nodes > 0)
+    {
+        bvh_device_on_host.qnodes = make_device_buffer_of(context, bvh_host.qnodes, bvh_host.max_nodes);
+        bvh_device_on_host.qnum_nodes = bvh_host.qnum_nodes;
+        bvh_device_on_host.flags = bvh_host.flags;
+    }
+    else
+    {
+        bvh_device_on_host.qnodes = NULL;
+        bvh_device_on_host.qnum_nodes = 0;
+        bvh_device_on_host.flags = (bvh_host.flags & ~1u);
+    }
+
+    if (bvh_host.lbvh_to_qbvh)
+    {
+        bvh_device_on_host.lbvh_to_qbvh = make_device_buffer_of(context, bvh_host.lbvh_to_qbvh, bvh_host.max_nodes);
+    }
+    else
+    {
+        bvh_device_on_host.lbvh_to_qbvh = NULL;
+    }
 }
 
 // create in-place given existing descriptor
@@ -900,6 +928,8 @@ void bvh_create_device(void* context, vec3* lowers, vec3* uppers, int num_items,
         bvh_device_on_host.qnodes = (QBVHNode*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(QBVHNode) * bvh_device_on_host.max_nodes);
         bvh_device_on_host.qnum_nodes = 0;
         bvh_device_on_host.flags = 0u;
+        bvh_device_on_host.lbvh_to_qbvh = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * bvh_device_on_host.max_nodes);
+        wp_memset_device(WP_CURRENT_CONTEXT, bvh_device_on_host.lbvh_to_qbvh, 0xFF, sizeof(int) * bvh_device_on_host.max_nodes);
 
         bvh_device_on_host.context = context ? context : wp_cuda_context_get_current();
 
@@ -924,6 +954,7 @@ void bvh_destroy_device(BVH& bvh)
     wp_free_device(WP_CURRENT_CONTEXT, bvh.keys); bvh.keys = NULL;
     wp_free_device(WP_CURRENT_CONTEXT, bvh.root); bvh.root = NULL;
     wp_free_device(WP_CURRENT_CONTEXT, bvh.qnodes); bvh.qnodes = NULL;
+    wp_free_device(WP_CURRENT_CONTEXT, bvh.lbvh_to_qbvh); bvh.lbvh_to_qbvh = NULL;
 }
 
 void bvh_refit_device(BVH& bvh)
