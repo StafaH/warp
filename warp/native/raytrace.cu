@@ -38,8 +38,8 @@ __global__ void build_geoms_kernel(
     const int w = wp::floordiv(idx, ngeom);
     const int g = idx % ngeom;
 
-    const int t = wp::index(geom_type, g);
-    const wp::vec3 s = wp::index(geom_size, w, g);
+    const int t = geom_type[g];
+    const wp::vec3 s = geom_size[w * ngeom + g];
     geoms[idx] = wp::Geom(t, s);
 }
 
@@ -50,12 +50,14 @@ __global__ void render_megakernel(
     const int img_width,
     const int img_height,
     const float fov_rad,
-    const wp::vec3* cam_xpos,
-    const wp::mat33* cam_xmat,
-    const wp::vec3* geom_xpos,   // [nworld * ngeom]
-    const wp::mat33* geom_xmat,  // [nworld * ngeom]
+    wp::array_t<wp::vec3> cam_xpos,
+    wp::array_t<wp::mat33> cam_xmat,
+    wp::array_t<wp::vec3> geom_xpos,   // [nworld, ngeom]
+    wp::array_t<wp::mat33> geom_xmat,  // [nworld, ngeom]
     const wp::Geom* geoms,       // [nworld * ngeom]
-    const int ngeom)
+    const int ngeom,
+    // output per-ray depth
+    wp::array_t<float> out_depth)
 {
     const int index = blockDim.x*blockIdx.x + threadIdx.x;
     if (index >= n) return;
@@ -66,9 +68,15 @@ __global__ void render_megakernel(
     const int px = pixel_index % img_width;
     const int py = wp::floordiv(pixel_index, img_width);
 
+    const int num_pixels = img_width*img_height;
+    const int total_views = nworld * ncam;
+
     for (int i = 0; i < 8; i++)
     {
-        const int view_index = view_index_offset + i;
+        const int base_view = view_index_offset * 8;
+        const int view_index = base_view + i;
+        if (view_index >= total_views)
+            break;
         const int world_index = wp::floordiv(view_index, ncam);
         const int cam_index = view_index % ncam;
 
@@ -80,14 +88,52 @@ __global__ void render_megakernel(
             fov_rad,
             px,
             py,
-            cam_xmat[(world_index * ncam) + cam_index],
+            wp::transpose(wp::index(cam_xmat, world_index, cam_index)),
             out_ray_dir);
 
-        // noop: geom passthrough currently unused, reserved for future raycast
-        (void)geom_xpos;
-        (void)geom_xmat;
-        (void)geoms;
-        (void)ngeom;
+        // Simple raycast loop over geoms for this world
+        float best_t = 0.0f;
+
+        // Ray origin: camera position
+        const wp::vec3 ray_o = wp::index(cam_xpos, world_index, cam_index);
+        const wp::vec3 ray_d = out_ray_dir;
+
+        // empty BVH ids placeholder (no mesh ray yet)
+        wp::array_t<wp::uint64> mesh_bvh_ids;
+
+        for (int gi = 0; gi < ngeom; ++gi)
+        {
+            const int idx = world_index * ngeom + gi;
+            const int type = geoms[idx].type;
+            const wp::vec3 size = geoms[idx].size;
+            const wp::vec3 gpos = wp::index(geom_xpos, world_index, gi);
+            const wp::mat33 grot = wp::index(geom_xmat, world_index, gi);
+
+            float t, u, v; int f, mid; wp::vec3 n;
+            bool h = wp::intersect_single_geom(
+                type,
+                0, // dataid placeholder
+                size,
+                mesh_bvh_ids,
+                gpos,
+                grot,
+                ray_o,
+                ray_d,
+                best_t,
+                t,
+                n,
+                u,
+                v,
+                f,
+                mid);
+
+            if (h && t < best_t)
+            {
+                best_t = t;
+            }
+        }
+
+        wp::array_store(out_depth, world_index, cam_index, pixel_index, best_t);
     }
 }
 
@@ -153,7 +199,7 @@ void wp_batch_renderer_destroy_device(uint64_t id)
 
         if (r.geoms)
         {
-            wp_free_device(WP_CURRENT_CONTEXT, (void*)r.geoms);
+            wp_free_device(WP_CURRENT_CONTEXT, r.geoms); r.geoms = nullptr;
         }
         wp_free_device(WP_CURRENT_CONTEXT, (wp::BatchRenderer*)id);
 
@@ -166,7 +212,8 @@ void wp_batch_renderer_render_device(
     wp::array_t<wp::vec3> cam_xpos,
     wp::array_t<wp::mat33> cam_xmat,
     wp::array_t<wp::vec3> geom_xpos,
-    wp::array_t<wp::mat33> geom_xmat)
+    wp::array_t<wp::mat33> geom_xmat,
+    wp::array_t<float> out_depth)
 {
     ContextGuard guard(WP_CURRENT_CONTEXT);
 
@@ -193,7 +240,8 @@ void wp_batch_renderer_render_device(
                 geom_xpos,
                 geom_xmat,
                 r.geoms,
-                r.ngeom
+                r.ngeom,
+                out_depth
             ));
     }
     else

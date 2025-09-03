@@ -154,7 +154,9 @@ extern "C"
         wp::array_t<wp::vec3> cam_xpos,
         wp::array_t<wp::mat33> cam_xmat,
         wp::array_t<wp::vec3> geom_xpos,
-        wp::array_t<wp::mat33> geom_xmat);
+        wp::array_t<wp::mat33> geom_xmat,
+        // output per-ray depth [nworld*ncam*img_width*img_height]
+        wp::array_t<float> out_depth);
 
     WP_API uint64_t wp_batch_renderer_create_device(
         void* context,
@@ -172,7 +174,9 @@ extern "C"
         wp::array_t<wp::vec3> cam_xpos,
         wp::array_t<wp::mat33> cam_xmat,
         wp::array_t<wp::vec3> geom_xpos,
-        wp::array_t<wp::mat33> geom_xmat);
+        wp::array_t<wp::mat33> geom_xmat,
+        // output per-ray depth [nworld*ncam*img_width*img_height]
+        wp::array_t<float> out_depth);
     
         // generic copy supporting non-contiguous arrays
     WP_API bool wp_array_copy_host(void* dst, void* src, int dst_type, int src_type, int elem_size);

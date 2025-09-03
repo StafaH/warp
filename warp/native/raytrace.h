@@ -90,7 +90,7 @@ CUDA_CALLABLE inline void compute_camera_ray(
     float h = tanf(fov_rad * 0.5f);
     float rx = u * 2.0f * h;
     float ry = -v * 2.0f * h / aspect;
-    float rz = -1.0f;
+    float rz = 1.0f;
 
     wp::vec3 dir_local_cam = wp::normalize(wp::vec3(rx, ry, rz));
     wp::vec3 d = wp::mul(cam_xmat, dir_local_cam);
@@ -427,6 +427,88 @@ CUDA_CALLABLE inline bool ray_mesh(
     out_mesh_id = -1;
     out_normal = wp::vec3(0.0f);
     return false;
+}
+
+// Intersect a single geom by type
+CUDA_CALLABLE inline bool intersect_single_geom(
+    int type,
+    int dataid, // reserved
+    const wp::vec3& size,
+    const wp::array_t<wp::uint64>& mesh_bvh_ids,
+    const wp::vec3& pos,
+    const wp::mat33& rot,
+    const wp::vec3& ray_o,
+    const wp::vec3& ray_d,
+    float max_t,
+    float& out_t,
+    wp::vec3& out_n,
+    float& out_u,
+    float& out_v,
+    int& out_f,
+    int& out_mesh_id)
+{
+    (void)dataid;
+    out_t = FLT_MAX;
+    out_n = wp::vec3(0.0f);
+    out_u = 0.0f;
+    out_v = 0.0f;
+    out_f = -1;
+    out_mesh_id = -1;
+
+    bool hit = false;
+    switch (type)
+    {
+        // 0: plane, 1: sphere, 2: capsule, 3: box, 4: mesh (example mapping)
+        case 0: // plane
+        {
+            wp::vec3 n;
+            float t;
+            if (ray_plane(pos, rot, size, ray_o, ray_d, t, n) && t < max_t)
+            { hit = true; out_t = t; out_n = n; }
+        } break;
+        case 1: // hfield
+        {
+            { hit = false; out_t = FLT_MAX; out_n = wp::vec3(0.0f); }
+        } break;
+        case 2: // sphere
+        {
+            wp::vec3 n;
+            float t;
+            if (ray_sphere(pos, size[0], ray_o, ray_d, t, n) && t < max_t)
+            { hit = true; out_t = t; out_n = n; }
+        } break;
+        case 3: // capsule
+        {
+            wp::vec3 n;
+            float t;
+            if (ray_capsule(pos, rot, size, ray_o, ray_d, t, n) && t < max_t)
+            { hit = true; out_t = t; out_n = n; }
+        } break;
+        case 4: // ellipsoid
+        {
+            { hit = false; out_t = FLT_MAX; out_n = wp::vec3(0.0f); }
+        } break;
+        case 5: // cylinder
+        {
+            { hit = false; out_t = FLT_MAX; out_n = wp::vec3(0.0f); }
+        } break;
+        case 6: // box
+        {
+            wp::vec3 n;
+            float t;
+            if (ray_box(pos, rot, size, ray_o, ray_d, t, n) && t < max_t)
+            { hit = true; out_t = t; out_n = n; }
+        } break;
+        case 7: // mesh
+        {
+            wp::vec3 n; float t, u, v; int f, mid;
+            if (ray_mesh(mesh_bvh_ids, dataid, pos, rot, ray_o, ray_d, max_t, t, n, u, v, f, mid))
+            { hit = true; out_t = t; out_n = n; out_u = u; out_v = v; out_f = f; out_mesh_id = mid; }
+        } break;
+        default: break;
+    }
+
+    return hit;
 }
 
 } // namespace wp

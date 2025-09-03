@@ -5392,6 +5392,7 @@ class BatchRenderer:
         cam_xmat: array,
         geom_xpos: array,
         geom_xmat: array,
+        out_depth: array,
     ) -> None:
         if self.device.is_cpu:
             self.runtime.core.wp_batch_renderer_render_host(
@@ -5400,6 +5401,7 @@ class BatchRenderer:
                 cam_xmat.__ctype__(),
                 geom_xpos.__ctype__(),
                 geom_xmat.__ctype__(),
+                out_depth.__ctype__(),
             )
         else:
             with self.device.context_guard:
@@ -5409,6 +5411,7 @@ class BatchRenderer:
                     cam_xmat.__ctype__(),
                     geom_xpos.__ctype__(),
                     geom_xmat.__ctype__(),
+                    out_depth.__ctype__(),
                 )
                 self.runtime.verify_cuda_device(self.device)
 

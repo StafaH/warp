@@ -75,11 +75,17 @@ void wp_batch_renderer_destroy_host(uint64_t id)
     delete r;
 }
 
-void wp_batch_renderer_render_host(uint64_t id, wp::array_t<wp::vec3> cam_xpos, wp::array_t<wp::mat33> cam_xmat, wp::array_t<wp::vec3> geom_xpos, wp::array_t<wp::mat33> geom_xmat)
+void wp_batch_renderer_render_host(
+    uint64_t id,
+    wp::array_t<wp::vec3> cam_xpos,
+    wp::array_t<wp::mat33> cam_xmat,
+    wp::array_t<wp::vec3> geom_xpos,
+    wp::array_t<wp::mat33> geom_xmat,
+    wp::array_t<float> out_depth)
 {
     BatchRenderer* r = (BatchRenderer*)(id);
     // TODO: implement host-side rendering
-    (void)cam_xpos; (void)cam_xmat; (void)geom_xpos; (void)geom_xmat; (void)r;
+    (void)cam_xpos; (void)cam_xmat; (void)geom_xpos; (void)geom_xmat; (void)r; (void)out_depth;
 }
 
 #if !WP_ENABLE_CUDA

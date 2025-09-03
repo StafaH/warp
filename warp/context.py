@@ -3875,9 +3875,11 @@ class Runtime:
                 warp.types.array_t,
                 warp.types.array_t,
                 warp.types.array_t,
+                warp.types.array_t,
             ]
             self.core.wp_batch_renderer_render_device.argtypes = [
                 ctypes.c_uint64,
+                warp.types.array_t,
                 warp.types.array_t,
                 warp.types.array_t,
                 warp.types.array_t,
