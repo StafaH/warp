@@ -2037,6 +2037,7 @@ inline CUDA_CALLABLE void adj_expect_near(const vec3& actual, const vec3& expect
 #include "svd.h"
 #include "hashgrid.h"
 #include "volume.h"
+#include "raytrace.h"
 #include "range.h"
 #include "rand.h"
 #include "noise.h"

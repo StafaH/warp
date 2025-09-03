@@ -288,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
             "native/crt.cpp",
             "native/error.cpp",
             "native/cuda_util.cpp",
+            "native/raytrace.cpp",
             "native/mesh.cpp",
             "native/hashgrid.cpp",
             "native/reduce.cpp",

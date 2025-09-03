@@ -3841,6 +3841,49 @@ class Runtime:
             ]
             self.core.wp_volume_get_blind_data_info.restype = ctypes.c_char_p
 
+            self.core.wp_batch_renderer_create_host.restype = ctypes.c_uint64
+            self.core.wp_batch_renderer_create_host.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_float,
+                ctypes.c_int,
+                warp.types.array_t,
+                warp.types.array_t,
+            ]
+
+            self.core.wp_batch_renderer_create_device.restype = ctypes.c_uint64
+            self.core.wp_batch_renderer_create_device.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_float,
+                ctypes.c_int,
+                warp.types.array_t,
+                warp.types.array_t,
+            ]
+            
+            self.core.wp_batch_renderer_destroy_host.argtypes = [ctypes.c_uint64]
+            self.core.wp_batch_renderer_destroy_device.argtypes = [ctypes.c_uint64]
+            
+            self.core.wp_batch_renderer_render_host.argtypes = [
+                ctypes.c_uint64,
+                warp.types.array_t,
+                warp.types.array_t,
+                warp.types.array_t,
+                warp.types.array_t,
+            ]
+            self.core.wp_batch_renderer_render_device.argtypes = [
+                ctypes.c_uint64,
+                warp.types.array_t,
+                warp.types.array_t,
+                warp.types.array_t,
+                warp.types.array_t,
+            ]
+
             bsr_matrix_from_triplets_argtypes = [
                 ctypes.c_int,  # block_size
                 ctypes.c_int,  # scalar size in bytes

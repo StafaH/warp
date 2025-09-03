@@ -4290,6 +4290,7 @@ void wp_cuda_timing_end(timing_result_t* results, int size)
 // impl. files
 #include "bvh.cu"
 #include "mesh.cu"
+#include "raytrace.cu"
 #include "sort.cu"
 #include "hashgrid.cu"
 #include "reduce.cu"

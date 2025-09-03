@@ -5322,6 +5322,97 @@ def _is_contiguous_vec_like_array(array, vec_length: int, scalar_types: tuple[ty
     )
 
 
+class BatchRenderer:
+    def __new__(cls, *args, **kwargs):
+        instance = super().__new__(cls)
+        instance.id = None
+        return instance
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        nworld: int,
+        ncam: int,
+        fov_rad: float,
+        ngeom: int,
+        geom_type: array,
+        geom_size: array,
+        device=None,
+    ):
+        self.runtime = warp.context.runtime
+        self.device = self.runtime.get_device(device)
+        self.width = int(width)
+        self.height = int(height)
+        self.nworld = int(nworld)
+        self.ncam = int(ncam)
+        self.fov_rad = float(fov_rad)
+
+        if self.device.is_cpu:
+            self.id = self.runtime.core.wp_batch_renderer_create_host(
+                self.width,
+                self.height,
+                self.nworld,
+                self.ncam,
+                self.fov_rad,
+                int(ngeom),
+                geom_type.__ctype__(),
+                geom_size.__ctype__(),
+            )
+        else:
+            self.id = self.runtime.core.wp_batch_renderer_create_device(
+                self.device.context,
+                self.width,
+                self.height,
+                self.nworld,
+                self.ncam,
+                self.fov_rad,
+                int(ngeom),
+                geom_type.__ctype__(),
+                geom_size.__ctype__(),
+            )
+
+        if self.id == 0:
+            raise RuntimeError("Failed to create BatchRenderer")
+
+    def __del__(self):
+        if not getattr(self, "id", None):
+            return
+        if not self.id:
+            return
+        if self.device.is_cpu:
+            self.runtime.core.wp_batch_renderer_destroy_host(self.id)
+        else:
+            with self.device.context_guard:
+                self.runtime.core.wp_batch_renderer_destroy_device(self.id)
+
+    def render(
+        self,
+        cam_xpos: array,
+        cam_xmat: array,
+        geom_xpos: array,
+        geom_xmat: array,
+    ) -> None:
+        if self.device.is_cpu:
+            self.runtime.core.wp_batch_renderer_render_host(
+                self.id,
+                cam_xpos.__ctype__(),
+                cam_xmat.__ctype__(),
+                geom_xpos.__ctype__(),
+                geom_xmat.__ctype__(),
+            )
+        else:
+            with self.device.context_guard:
+                self.runtime.core.wp_batch_renderer_render_device(
+                    self.id,
+                    cam_xpos.__ctype__(),
+                    cam_xmat.__ctype__(),
+                    geom_xpos.__ctype__(),
+                    geom_xmat.__ctype__(),
+                )
+                self.runtime.verify_cuda_device(self.device)
+
+
 # definition just for kernel type (cannot be a parameter), see mesh.h
 # NOTE: its layout must match the mesh_query_point_t struct defined in C.
 # NOTE: it needs to be defined after `indexedarray` to workaround a circular import issue.

@@ -138,7 +138,43 @@ extern "C"
     WP_API void wp_marching_cubes_destroy_device(uint64_t id);
     WP_API int wp_marching_cubes_surface_device(uint64_t id, const float* field, int nx, int ny, int nz, float threshold, wp::vec3* verts, int* triangles, int max_verts, int max_tris, int* out_num_verts, int* out_num_tris);
 
-    // generic copy supporting non-contiguous arrays
+    // Batch renderer API
+    WP_API uint64_t wp_batch_renderer_create_host(
+        int img_width,
+        int img_height,
+        int nworld,
+        int ncam,
+        float fov_rad,
+        int ngeom,
+        wp::array_t<int> geom_type,
+        wp::array_t<wp::vec3> geom_size);
+    WP_API void wp_batch_renderer_destroy_host(uint64_t id);
+    WP_API void wp_batch_renderer_render_host(
+        uint64_t id,
+        wp::array_t<wp::vec3> cam_xpos,
+        wp::array_t<wp::mat33> cam_xmat,
+        wp::array_t<wp::vec3> geom_xpos,
+        wp::array_t<wp::mat33> geom_xmat);
+
+    WP_API uint64_t wp_batch_renderer_create_device(
+        void* context,
+        int img_width,
+        int img_height,
+        int nworld,
+        int ncam,
+        float fov_rad,
+        int ngeom,
+        wp::array_t<int> geom_type,
+        wp::array_t<wp::vec3> geom_size);
+    WP_API void wp_batch_renderer_destroy_device(uint64_t id);
+    WP_API void wp_batch_renderer_render_device(
+        uint64_t id,
+        wp::array_t<wp::vec3> cam_xpos,
+        wp::array_t<wp::mat33> cam_xmat,
+        wp::array_t<wp::vec3> geom_xpos,
+        wp::array_t<wp::mat33> geom_xmat);
+    
+        // generic copy supporting non-contiguous arrays
     WP_API bool wp_array_copy_host(void* dst, void* src, int dst_type, int src_type, int elem_size);
     WP_API bool wp_array_copy_device(void* context, void* dst, void* src, int dst_type, int src_type, int elem_size);
 
