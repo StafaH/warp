@@ -4432,7 +4432,6 @@ class Texture:
             return
         self.data = data
         self.device = data.device
-        print("data.size", data.size)
         
         if self.device.is_cpu:
             raise NotImplementedError("Texture creation on CPU is not supported")
@@ -4452,7 +4451,6 @@ class Texture:
                 ctypes.c_int(address_mode),
                 ctypes.c_int(filter_mode),
             )
-            print("self.id", self.id)
 
         if self.id == 0:
             raise RuntimeError("Failed to create texture from input array")

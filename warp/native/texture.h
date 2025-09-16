@@ -61,26 +61,20 @@ CUDA_CALLABLE inline vec4 texture_sample_v4(uint64 id, vec2 uv)
         return {0.0f, 0.0f, 0.0f, 0.0f};
     cudaTextureObject_t tex = (cudaTextureObject_t)(t->handle);
 
-    float u = uv[0];
-    float v = uv[1];
-    // clamp to [0,1]
-    u = max(0.0f, min(1.0f, u));
-    v = max(0.0f, min(1.0f, v));
-
     // sample according to channel count
     if (t->num_channels <= 1)
     {
-        float c = tex2D<float>(tex, u, v);
+        float c = tex2D<float>(tex, uv[0], uv[1]);
         return {c, c, c, 1.0f};
     }
     else if (t->num_channels == 2)
     {
-        float2 c = tex2D<float2>(tex, u, v);
+        float2 c = tex2D<float2>(tex, uv[0], uv[1]);
         return {c.x, c.y, 0.0f, 1.0f};
     }
     else
     {
-        float4 c = tex2D<float4>(tex, u, v);
+        float4 c = tex2D<float4>(tex, uv[0], uv[1]);
         return {c.x, c.y, c.z, 1.0f};
     }
 #else

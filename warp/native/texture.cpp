@@ -88,9 +88,9 @@ WP_API uint64_t wp_texture_create_device(void* context,
 
     cudaTextureDesc tex_desc = {};
     tex_desc.normalizedCoords = 1;
-    tex_desc.addressMode[0] = cudaAddressModeWrap;
-    tex_desc.addressMode[1] = cudaAddressModeWrap;
-    tex_desc.filterMode = cudaFilterModeLinear;
+    tex_desc.addressMode[0] = cudaAddressModeClamp;
+    tex_desc.addressMode[1] = cudaAddressModeClamp;
+    tex_desc.filterMode     = cudaFilterModeLinear;
     tex_desc.readMode = cudaReadModeNormalizedFloat;
 
     cudaTextureObject_t tex_obj = 0;
