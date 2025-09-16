@@ -131,6 +131,7 @@ from warp.types import Bvh as Bvh
 from warp.types import Mesh as Mesh
 from warp.types import HashGrid as HashGrid
 from warp.types import Volume as Volume
+from warp.types import Texture as Texture
 from warp.types import BvhQuery as BvhQuery
 from warp.types import HashGridQuery as HashGridQuery
 from warp.types import MeshQueryAABB as MeshQueryAABB

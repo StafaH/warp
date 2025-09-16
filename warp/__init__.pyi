@@ -150,6 +150,7 @@ from warp.types import Scalar as Scalar
 from warp.types import Bvh as Bvh
 from warp.types import Mesh as Mesh
 from warp.types import HashGrid as HashGrid
+from warp.types import Texture as Texture
 from warp.types import Volume as Volume
 from warp.types import BvhQuery as BvhQuery
 from warp.types import HashGridQuery as HashGridQuery
@@ -2189,6 +2190,21 @@ def volume_index_to_world_dir(id: uint64, uvw: vec3f) -> vec3f:
 @over
 def volume_world_to_index_dir(id: uint64, xyz: vec3f) -> vec3f:
     """Transform a direction ``xyz`` defined in volume world space to the volume's index space given the volume's intrinsic affine transformation."""
+    ...
+
+@over
+def texture_sample_f(id: uint64, uv: vec2f) -> float:
+    """Sample a single-channel texture at normalized coordinates ``uv`` using linear filtering."""
+    ...
+
+@over
+def texture_sample_v3(id: uint64, uv: vec2f) -> vec3f:
+    """Sample a 3-channel texture at normalized coordinates ``uv`` using linear filtering."""
+    ...
+
+@over
+def texture_sample_v4(id: uint64, uv: vec2f) -> vec4f:
+    """Sample a 4-channel texture at normalized coordinates ``uv`` using linear filtering."""
     ...
 
 @over
