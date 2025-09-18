@@ -39,8 +39,39 @@
 #define WP_BVH_BLOCK_DIM 256
 #endif
 
+#define QBVH_WIDTH (4)
+#define QBVH_QUANT_BITS (8)
+#define QBVH_QUANT_MAX ((1u<<QBVH_QUANT_BITS)-1u)
+#define QBVH_INVALID (0xFFFFFFFFu)
+#define QBVH_LEAF_BIT (0x80000000u)
+#define QBVH_INDEX_MASK (0x7FFFFFFFu)
+#define WP_ENABLE_QBVH 1
+
 namespace wp
 {
+
+CUDA_CALLABLE inline uint32_t qbvh_leaf_node(uint32_t lbvh_index) {
+    return (lbvh_index | QBVH_LEAF_BIT);
+}
+CUDA_CALLABLE inline bool qbvh_is_leaf(uint32_t tagged) {
+    return (tagged & QBVH_LEAF_BIT) != 0;
+}
+CUDA_CALLABLE inline uint32_t qbvh_leaf_lbvh_index(uint32_t tagged) {
+    return (tagged & QBVH_INDEX_MASK);
+}
+
+CUDA_CALLABLE inline unsigned char qfloor(float t) {
+    int v = (int)floorf(t);
+    if (v < 0) v = 0;
+    if (v > (int)QBVH_QUANT_MAX) v = QBVH_QUANT_MAX;
+    return (unsigned char)v;
+}
+CUDA_CALLABLE inline unsigned char qceil(float t) {
+    int v = (int)ceilf(t);
+    if (v < 0) v = 0;
+    if (v > (int)QBVH_QUANT_MAX) v = QBVH_QUANT_MAX;
+    return (unsigned char)v;
+}
 
 struct bounds3
 {
@@ -173,6 +204,21 @@ struct BVHPackedNodeHalf
     unsigned int b : 1;
 };
 
+struct QBVHNode {
+	wp::vec3f min_point;
+	wp::vec3f inv_scale;
+
+	uint8_t qminx[QBVH_WIDTH];
+	uint8_t qminy[QBVH_WIDTH];
+	uint8_t qminz[QBVH_WIDTH];
+	uint8_t qmaxx[QBVH_WIDTH];
+	uint8_t qmaxy[QBVH_WIDTH];
+	uint8_t qmaxz[QBVH_WIDTH];
+
+	uint32_t children_idx[QBVH_WIDTH];
+    uint8_t num_children;
+}; 
+
 struct BVH
 {		
     BVHPackedNodeHalf* node_lowers;
@@ -204,9 +250,12 @@ struct BVH
 	int* item_groups;
 	int num_items;
 
+    QBVHNode* qbvh_nodes;
+
     // cuda context
     void* context;
 };
+
 
 CUDA_CALLABLE inline BVHPackedNodeHalf make_node(const vec3& bound, int child, bool leaf)
 {
@@ -219,6 +268,7 @@ CUDA_CALLABLE inline BVHPackedNodeHalf make_node(const vec3& bound, int child, b
 
     return n;
 }
+
 
 // variation of make_node through volatile pointers used in build_hierarchy
 CUDA_CALLABLE inline void make_node(volatile BVHPackedNodeHalf* n, const vec3& bound, int child, bool leaf)
@@ -378,7 +428,8 @@ struct bvh_query_t
           input_lower(),
           input_upper(),
           bounds_nr(0),
-          primitive_counter(-1)
+          primitive_counter(-1),
+          leaf_end(-1)
     {}
 
     // Required for adjoint computations.
@@ -397,8 +448,8 @@ struct bvh_query_t
 #endif
     int count;
 
-    // >= 0 if currently in a packed leaf node
-    int primitive_counter;
+    int primitive_counter;   // >= 0 if currently in a packed leaf node
+    int leaf_end;            // exclusive end in leaf-space (valid when primitive_counter>=0)
     
     // inputs
     wp::vec3 input_lower;	// start for ray
@@ -419,6 +470,20 @@ CUDA_CALLABLE inline bool bvh_query_intersection_test(const bvh_query_t& query, 
     {
         return intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
     }
+}
+
+CUDA_CALLABLE inline void qbvh_child_bounds_world(const QBVHNode& n, int i, vec3& lower, vec3& upper)
+{
+    // Convert to world = min + q / inv_scale = min + q * (extent / QMAX)
+    const vec3 scale(1.0f/n.inv_scale[0], 1.0f/n.inv_scale[1], 1.0f/n.inv_scale[2]);
+
+    lower = n.min_point + vec3((float)n.qminx[i]*scale[0],
+                               (float)n.qminy[i]*scale[1],
+                               (float)n.qminz[i]*scale[2]);
+
+    upper = n.min_point + vec3((float)n.qmaxx[i]*scale[0],
+                               (float)n.qmaxy[i]*scale[1],
+                               (float)n.qmaxz[i]*scale[2]);
 }
 
 CUDA_CALLABLE inline bvh_query_t bvh_query(
@@ -448,7 +513,17 @@ CUDA_CALLABLE inline bvh_query_t bvh_query(
 	query.input_lower = lower;
 	query.input_upper = upper;
 
-    // Navigate through the bvh, find the first overlapping leaf node.
+#if WP_ENABLE_QBVH
+    // Only use QBVH traversal if a QBVH has been built
+    if (bvh.qbvh_nodes)
+    {
+        query.stack[0] = (root == -1 ? *bvh.root : root);
+        query.count = 1;
+        return query;
+    }
+#endif
+
+    // Navigate through the LBVH, find the first overlapping leaf node.
     while (query.count)
     {
         const int node_index = query.stack[--query.count];
@@ -515,7 +590,139 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index)
 {
     BVH bvh = query.bvh;
 
-    // Navigate through the bvh, find the first overlapping leaf node.
+    // If we are in the middle of a packed leaf range, keep returning its primitives
+    if (query.primitive_counter >= 0 && query.primitive_counter < query.leaf_end) {
+        const int prim = query.bvh.primitive_indices[query.primitive_counter++];
+        index = prim;
+        query.bounds_nr = prim;
+        return true;
+    } else if (query.primitive_counter >= query.leaf_end && query.leaf_end >= 0) {
+        // range finished
+        query.primitive_counter = -1;
+        query.leaf_end = -1;
+    }
+
+#if WP_ENABLE_QBVH
+    if (bvh.qbvh_nodes)
+    {
+        // Pop until we find a hit (leaf or internal)
+        while (query.count)
+        {
+            const uint32_t tagged = (uint32_t)query.stack[--query.count];
+
+            if (qbvh_is_leaf(tagged))
+            {
+                const int lbvh_idx = (int)qbvh_leaf_lbvh_index(tagged);
+
+                // Refine against exact LBVH leaf AABB (removes rare quantization false positives)
+                BVHPackedNodeHalf cL = bvh_load_node(bvh.node_lowers, lbvh_idx);
+                BVHPackedNodeHalf cU = bvh_load_node(bvh.node_uppers, lbvh_idx);
+                if (!bvh_query_intersection_test(query,
+                        reinterpret_cast<vec3&>(cL),
+                        reinterpret_cast<vec3&>(cU)))
+                {
+                    continue;
+                }
+                
+                // Detect original vs packed leaf:
+                // - original leaf: cU.i == cL.i  (stores primitive_id)
+                // - packed leaf:   cU.i  > cL.i  (stores [start_leaf, end_leaf))
+                if (cU.i == cL.i) {
+                    // original LBVH leaf: single primitive = primitive_indices[leaf_index]
+                    const int prim = bvh.primitive_indices[lbvh_idx];
+                    index = prim;
+                    query.bounds_nr = prim;
+                    return true;
+                } else {
+                    // packed leaf range: iterate leaf indices [start,end) -> primitives
+                    query.primitive_counter = cL.i;
+                    query.leaf_end = cU.i;
+                
+                    const int prim = bvh.primitive_indices[query.primitive_counter++];
+                    index = prim;
+                    query.bounds_nr = prim;
+                    return true;
+                }
+            }
+            else
+            {
+                // Internal QBVH node
+                const int qbvh_idx = (int)tagged;
+                const QBVHNode n   = bvh.qbvh_nodes[qbvh_idx];
+
+                // Quick out: empty node (possible if widen failed)
+                if (n.num_children == 0)
+                    continue;
+
+                // Gather overlapping children (up to 4), compute entry t for rays
+                uint32_t child_ids[QBVH_WIDTH];
+                float    tvals[QBVH_WIDTH];
+                int      hits = 0;
+
+                // Precompute world-space scale once per node
+                vec3 scale(1.0f/n.inv_scale[0], 1.0f/n.inv_scale[1], 1.0f/n.inv_scale[2]);
+
+                for (int i = 0; i < n.num_children; ++i)
+                {
+                    // Reconstruct conservative child bounds (world)
+                    vec3 cmin = n.min_point + vec3((float)n.qminx[i]*scale[0],
+                                                    (float)n.qminy[i]*scale[1],
+                                                    (float)n.qminz[i]*scale[2]);
+                    vec3 cmax = n.min_point + vec3((float)n.qmaxx[i]*scale[0],
+                                                    (float)n.qmaxy[i]*scale[1],
+                                                    (float)n.qmaxz[i]*scale[2]);
+
+                    bool hit;
+                    float tnear = 0.0f;
+                    if (query.is_ray)
+                        hit = intersect_ray_aabb(query.input_lower, query.input_upper, cmin, cmax, tnear);
+                    else
+                        hit = intersect_aabb_aabb(query.input_lower, query.input_upper, cmin, cmax);
+
+                    if (hit)
+                    {
+                        child_ids[hits] = n.children_idx[i];
+                        tvals[hits]     = query.is_ray ? tnear : 0.0f;
+                        ++hits;
+                    }
+                }
+
+                if (hits == 0)
+                    continue;
+
+                // Near-to-far for rays (small insertion sort; hits <= 4)
+                if (query.is_ray && hits > 1)
+                {
+                    for (int i = 1; i < hits; ++i)
+                    {
+                        float    t = tvals[i];
+                        uint32_t c = child_ids[i];
+                        int j = i - 1;
+                        while (j >= 0 && t < tvals[j])
+                        {
+                            tvals[j+1]   = tvals[j];
+                            child_ids[j+1] = child_ids[j];
+                            --j;
+                        }
+                        tvals[j+1] = t;
+                        child_ids[j+1] = c;
+                    }
+                }
+
+                // Push in reverse so the nearest child is popped first
+                for (int i = hits - 1; i >= 0; --i)
+                {
+                    if (query.count < BVH_QUERY_STACK_SIZE)
+                        query.stack[query.count++] = (int)child_ids[i];
+                    // else: stack overflow; drop far children. Consider increasing BVH_QUERY_STACK_SIZE for QBVH.
+                }
+            }
+        }
+        return false;
+    }
+#endif // WP_ENABLE_QBVH
+
+    // Navigate through the LBVH, find the first overlapping leaf node.
     while (query.count)
     {
         const int node_index = query.stack[--query.count];
@@ -533,14 +740,26 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index)
 
         if (node_lower.b)
         {
-            // found leaf, loop through its content primitives
-            const int start = left_index;
-            const int end = right_index;
-
-            int primitive_index = bvh.primitive_indices[start];
-            index = primitive_index;
-            query.bounds_nr = primitive_index;
-            return true;
+            // found leaf
+            const int left_index  = node_lower.i;
+            const int right_index = node_upper.i;
+        
+            if (right_index == left_index) {
+                // original leaf: single primitive = primitive_indices[leaf_index]
+                const int prim = bvh.primitive_indices[node_index];
+                index = prim;
+                query.bounds_nr = prim;
+                return true;
+            } else {
+                // packed leaf range
+                query.primitive_counter = left_index;
+                query.leaf_end = right_index;
+        
+                const int prim = bvh.primitive_indices[query.primitive_counter++];
+                index = prim;
+                query.bounds_nr = prim;
+                return true;
+            }
         }
         else
         {

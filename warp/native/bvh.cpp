@@ -521,6 +521,11 @@ void bvh_destroy_host(BVH& bvh)
 
     bvh.max_nodes = 0;
     bvh.num_items = 0;
+
+#ifdef WP_ENABLE_QBVH
+    delete[] bvh.qbvh_nodes;
+    bvh.qbvh_nodes = nullptr;
+#endif
 }
 
 } // namespace wp
