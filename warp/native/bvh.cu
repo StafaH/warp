@@ -184,6 +184,7 @@ private:
     int* range_lefts;
     int* range_rights;
     int* num_children;
+    int* group_roots;
 
     // bounds data when total item bounds built on GPU
     vec3* total_lower;
@@ -267,7 +268,9 @@ __global__ void build_hierarchy(int n,
                                 volatile int* __restrict__ range_rights,
                                 volatile int* __restrict__ parents,
                                 volatile BVHPackedNodeHalf* __restrict__ lowers,
-                                volatile BVHPackedNodeHalf* __restrict__ uppers)
+                                volatile BVHPackedNodeHalf* __restrict__ uppers,
+                                int* __restrict__ group_roots,
+                                int num_group_slots)
 {
     int index = blockDim.x*blockIdx.x + threadIdx.x;
 
@@ -285,6 +288,16 @@ __global__ void build_hierarchy(int n,
             {					
                 *root = index;
                 parents[index] = -1;
+                // Single-group scene: mark the global root for that group
+                if (group_roots)
+                {
+                    const uint32_t g_left  = (uint32_t)(keys[left] >> 32);
+                    const uint32_t g_right = (uint32_t)(keys[right] >> 32);
+                    if (g_left == g_right && (int)g_left < num_group_slots)
+                    {
+                        atomicCAS(&group_roots[g_left], -1, index);
+                    }
+                }
 
                 break;
             }
@@ -395,6 +408,26 @@ __global__ void build_hierarchy(int n,
                 make_node(lowers+parent, lower, left_child, false);
                 make_node(uppers+parent, upper, right_child, false);
 
+                // If this parent merges different groups, record per-group subtree roots
+                if (group_roots)
+                {
+                    const int left_range  = range_lefts[parent];
+                    const int right_range = range_rights[parent];
+                    const uint32_t g_left  = (uint32_t)(keys[left_range] >> 32);
+                    const uint32_t g_right = (uint32_t)(keys[right_range] >> 32);
+                    if (g_left != g_right)
+                    {
+                        if ((int)g_left < num_group_slots)
+                        {
+                            atomicCAS(&group_roots[g_left], -1, left_child);
+                        }
+                        if ((int)g_right < num_group_slots)
+                        {
+                            atomicCAS(&group_roots[g_right], -1, right_child);
+                        }
+                    }
+                }
+
                 // move onto processing the parent
                 index = parent;
             }
@@ -445,12 +478,10 @@ __global__ void mark_packed_leaf_nodes(int n,
 
         // avoid creating packed leaves that straddle group boundaries
         bool single_group = true;
-        if (keys)
-        {
-            const uint64_t group_left = keys[left] >> 32;
-            const uint64_t group_right = keys[right - 1] >> 32;
-            single_group = (group_left == group_right);
-        }
+
+        const uint64_t group_left = keys[left] >> 32;
+        const uint64_t group_right = keys[right - 1] >> 32;
+        single_group = (group_left == group_right);
 
         if (single_group && (right - left <= BVH_LEAF_SIZE || depth >= BVH_QUERY_STACK_SIZE))
         {
@@ -478,7 +509,6 @@ __global__ void build_qbvh_from_lbvh(
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
 
     const int lbvh_root = *root;
-    printf("lbvh_root: %d\n", lbvh_root);
     if (lbvh_root < 0 || lbvh_root >= max_nodes) return;
 
     // Work stack (DFS); pick a safe bound
@@ -494,7 +524,6 @@ __global__ void build_qbvh_from_lbvh(
         const WidenTask task = stack[--sp];
         const uint32_t lbvh_idx = task.lbvh_node;
         const uint32_t qbvh_idx = task.qbvh_node;
-        printf("widen task: lbvh_idx: %d, qbvh_idx: %d\n", lbvh_idx, qbvh_idx);
 
         QBVHNode n{}; // zero-init
         
@@ -606,6 +635,144 @@ __global__ void build_qbvh_from_lbvh(
     }
 }
 
+// Build QBVH in parallel: one thread per group root recorded at the first leaf index of each group
+__global__ void build_qbvh_from_group_roots(
+    const BVHPackedNodeHalf* __restrict__ lowers,
+    const BVHPackedNodeHalf* __restrict__ uppers,
+    int num_groups,
+    const int* __restrict__ group_roots,
+    int max_nodes,
+    QBVHNode* __restrict__ out_qnodes)
+{
+    const int group_id = blockDim.x*blockIdx.x + threadIdx.x;
+    if (group_id >= num_groups)
+        return;
+
+    const int lbvh_root = group_roots[group_id];
+    if (lbvh_root < 0 || lbvh_root >= max_nodes)
+        return;
+
+    // Local DFS stack for widening this subtree
+    const int kMaxWork = 1024;
+    WidenTask stack[kMaxWork];
+    int sp = 0;
+
+    // Initialize QBVH node at the SAME index as LBVH internal
+    out_qnodes[lbvh_root] = QBVHNode{};
+    stack[sp++] = { (uint32_t)lbvh_root, (uint32_t)lbvh_root };
+
+    while (sp > 0)
+    {
+        const WidenTask task = stack[--sp];
+        const uint32_t lbvh_idx = task.lbvh_node;
+        const uint32_t qbvh_idx = task.qbvh_node;
+
+        QBVHNode n{};
+
+        if (lowers[lbvh_idx].b)
+        {
+            const BVHPackedNodeHalf cL = lowers[lbvh_idx];
+            const BVHPackedNodeHalf cU = uppers[lbvh_idx];
+
+            const float ex = fmaxf(cU.x - cL.x, 1e-6f);
+            const float ey = fmaxf(cU.y - cL.y, 1e-6f);
+            const float ez = fmaxf(cU.z - cL.z, 1e-6f);
+
+            n.min_point = vec3(cL.x, cL.y, cL.z);
+            n.inv_scale = vec3((float)QBVH_QUANT_MAX / ex,
+                               (float)QBVH_QUANT_MAX / ey,
+                               (float)QBVH_QUANT_MAX / ez);
+
+            n.qminx[0] = 0; n.qminy[0] = 0; n.qminz[0] = 0;
+            n.qmaxx[0] = QBVH_QUANT_MAX; n.qmaxy[0] = QBVH_QUANT_MAX; n.qmaxz[0] = QBVH_QUANT_MAX;
+            n.children_idx[0] = qbvh_leaf_node(lbvh_idx);
+            n.num_children = 1;
+
+            out_qnodes[qbvh_idx] = n;
+            continue;
+        }
+
+        // Build child set by expanding internal LBVH nodes until we have <= W
+        uint32_t queue[QBVH_WIDTH];
+        int qsz = 0;
+        queue[qsz++] = lbvh_idx;
+
+        for (;;)
+        {
+            if (qsz + 1 > QBVH_WIDTH) break;
+            int internal_pos = -1;
+            for (int i = 0; i < qsz; ++i)
+            {
+                if (!lowers[queue[i]].b) { internal_pos = i; break; }
+            }
+            if (internal_pos < 0) break;
+
+            const uint32_t nidx = queue[internal_pos];
+            queue[internal_pos] = queue[--qsz];
+
+            const uint32_t left  = (uint32_t)lowers[nidx].i;
+            const uint32_t right = (uint32_t)uppers[nidx].i;
+            queue[qsz++] = left;
+            if (qsz < QBVH_WIDTH)
+                queue[qsz++] = right;
+            else
+                break;
+        }
+
+        const int nchild = qsz;
+
+        float minx =  FLT_MAX, miny =  FLT_MAX, minz =  FLT_MAX;
+        float maxx = -FLT_MAX, maxy = -FLT_MAX, maxz = -FLT_MAX;
+        for (int i = 0; i < nchild; ++i)
+        {
+            const BVHPackedNodeHalf cL = lowers[queue[i]];
+            const BVHPackedNodeHalf cU = uppers[queue[i]];
+            minx = fminf(minx, cL.x);  miny = fminf(miny, cL.y);  minz = fminf(minz, cL.z);
+            maxx = fmaxf(maxx, cU.x);  maxy = fmaxf(maxy, cU.y);  maxz = fmaxf(maxz, cU.z);
+        }
+
+        const float ex = fmaxf(maxx - minx, 1e-6f);
+        const float ey = fmaxf(maxy - miny, 1e-6f);
+        const float ez = fmaxf(maxz - minz, 1e-6f);
+
+        n.num_children = (uint8_t)nchild;
+        n.min_point = vec3(minx, miny, minz);
+        n.inv_scale = vec3((float)QBVH_QUANT_MAX / ex,
+                           (float)QBVH_QUANT_MAX / ey,
+                           (float)QBVH_QUANT_MAX / ez);
+
+        for (int i = 0; i < nchild; ++i)
+        {
+            const uint32_t c = queue[i];
+            const BVHPackedNodeHalf cL = lowers[c];
+            const BVHPackedNodeHalf cU = uppers[c];
+
+            const float qlx = (cL.x - minx) * n.inv_scale[0];
+            const float qly = (cL.y - miny) * n.inv_scale[1];
+            const float qlz = (cL.z - minz) * n.inv_scale[2];
+            const float qux = (cU.x - minx) * n.inv_scale[0];
+            const float quy = (cU.y - miny) * n.inv_scale[1];
+            const float quz = (cU.z - minz) * n.inv_scale[2];
+
+            n.qminx[i] = qfloor(qlx); n.qminy[i] = qfloor(qly); n.qminz[i] = qfloor(qlz);
+            n.qmaxx[i] = qceil (qux); n.qmaxy[i] = qceil (quy); n.qmaxz[i] = qceil (quz);
+
+            if (cL.b)
+            {
+                n.children_idx[i] = qbvh_leaf_node(c);
+            }
+            else
+            {
+                n.children_idx[i] = c;
+                out_qnodes[c] = QBVHNode{};
+                if (sp < kMaxWork) stack[sp++] = WidenTask{ c, c };
+            }
+        }
+
+        out_qnodes[qbvh_idx] = n;
+    }
+}
+
 
 CUDA_CALLABLE inline vec3 Vec3Max(const vec3& a, const vec3& b) { return wp::max(a, b); }
 CUDA_CALLABLE inline vec3 Vec3Min(const vec3& a, const vec3& b) { return wp::min(a, b); }
@@ -663,6 +830,7 @@ LinearBVHBuilderGPU::LinearBVHBuilderGPU()
     , total_lower(NULL)
     , total_upper(NULL)
     , total_inv_edges(NULL)
+    , group_roots(NULL)
 {
     total_lower = (vec3*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(vec3));
     total_upper = (vec3*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(vec3));
@@ -687,6 +855,7 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
     range_lefts = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*bvh.max_nodes);
     range_rights = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*bvh.max_nodes);
     num_children = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int)*bvh.max_nodes);
+    group_roots = NULL;
 
     // if total bounds supplied by the host then we just 
     // compute our edge length and upload it to the GPU directly
@@ -739,12 +908,26 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
     // reset children count, this is our atomic counter so we know when an internal node is complete, only used during building
     wp_memset_device(WP_CURRENT_CONTEXT, num_children, 0, sizeof(int)*bvh.max_nodes);
 
-    // build the tree and internal node bounds
-    wp_launch_device(WP_CURRENT_CONTEXT, build_hierarchy, num_items, (num_items, bvh.root, deltas, bvh.keys, num_children, bvh.primitive_indices, range_lefts, range_rights, bvh.node_parents, bvh.node_lowers, bvh.node_uppers));
+    // Determine number of group ids as (last_key.group + 1);
+    // keys are sorted by (group << 32) | morton, so last item has the max group id
+    int num_groups = 1;
+    {
+        uint64_t last_key = 0;
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, &last_key, keys + (num_items - 1), sizeof(uint64_t));
+        uint32_t max_gid = (uint32_t)(last_key >> 32);
+        num_groups = (int)max_gid + 1;
+    }
+    // Allocate and initialize per-group roots table (indexed by group id)
+    group_roots = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * std::max(1, num_groups));
+    wp_memset_device(WP_CURRENT_CONTEXT, group_roots, 0xFF, sizeof(int) * std::max(1, num_groups));
+
+    // build the tree and internal node bounds; record group roots during upward propagation
+    wp_launch_device(WP_CURRENT_CONTEXT, build_hierarchy, num_items, (num_items, bvh.root, deltas, bvh.keys, num_children, bvh.primitive_indices, range_lefts, range_rights, bvh.node_parents, bvh.node_lowers, bvh.node_uppers, group_roots, num_groups));
     wp_launch_device(WP_CURRENT_CONTEXT, mark_packed_leaf_nodes, bvh.max_nodes, (bvh.max_nodes, range_lefts, range_rights, bvh.node_parents, bvh.keys, bvh.node_lowers, bvh.node_uppers));
 
 #ifdef WP_ENABLE_QBVH
-    wp_launch_device(WP_CURRENT_CONTEXT, build_qbvh_from_lbvh, 1, (bvh.node_lowers, bvh.node_uppers, bvh.root, bvh.max_nodes, bvh.qbvh_nodes));
+    // Build QBVH in parallel, one thread per group id
+    wp_launch_device(WP_CURRENT_CONTEXT, build_qbvh_from_group_roots, num_groups, (bvh.node_lowers, bvh.node_uppers, num_groups, group_roots, bvh.max_nodes, bvh.qbvh_nodes));
 #endif
 
     // free temporary memory
@@ -755,7 +938,7 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
     wp_free_device(WP_CURRENT_CONTEXT, range_lefts);
     wp_free_device(WP_CURRENT_CONTEXT, range_rights);
     wp_free_device(WP_CURRENT_CONTEXT, num_children);
-
+    if (group_roots) wp_free_device(WP_CURRENT_CONTEXT, group_roots);
 }
 
 // buffer_size is the number of T, not the number of bytes
