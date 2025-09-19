@@ -25,6 +25,10 @@
 
 #define BVH_DEBUG 0
 
+#ifndef BVH_QUERY_STACK_SIZE
+#define BVH_QUERY_STACK_SIZE 32
+#endif
+
 namespace wp
 {
 
@@ -124,6 +128,135 @@ CUDA_CALLABLE inline float mesh_query_inside(uint64_t id, const vec3& p);
 CUDA_CALLABLE inline bool mesh_query_point(uint64_t id, const vec3& point, float max_dist, float& inside, int& face, float& u, float& v)
 {
     Mesh mesh = mesh_get(id);
+
+#if WP_ENABLE_QBVH
+    if (mesh.bvh.qbvh_nodes)
+    {
+        uint32_t stack[BVH_QUERY_STACK_SIZE];
+        int count = 0;
+        stack[count++] = (uint32_t)(*mesh.bvh.root);
+
+        float min_dist_sq = max_dist*max_dist;
+        int min_face = -1;
+        float min_v = 0.0f;
+        float min_w = 0.0f;
+
+        while (count)
+        {
+            const uint32_t tagged = stack[--count];
+
+            if (qbvh_is_leaf(tagged))
+            {
+                const int lbvh_idx = (int)qbvh_leaf_lbvh_index(tagged);
+                // Refine against exact LBVH leaf AABB
+                BVHPackedNodeHalf cL = bvh_load_node(mesh.bvh.node_lowers, lbvh_idx);
+                BVHPackedNodeHalf cU = bvh_load_node(mesh.bvh.node_uppers, lbvh_idx);
+
+                float node_dist_sq = distance_to_aabb_sq(point,
+                    vec3(cL.x, cL.y, cL.z), vec3(cU.x, cU.y, cU.z));
+                if (node_dist_sq > min_dist_sq)
+                    continue;
+
+                // Leaf payload: iterate primitive range [start,end)
+                const int start = cL.i;
+                const int end   = cU.i;
+                for (int primitive_counter = start; primitive_counter < end; ++primitive_counter)
+                {
+                    int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
+                    int i = mesh.indices[primitive_index * 3 + 0];
+                    int j = mesh.indices[primitive_index * 3 + 1];
+                    int k = mesh.indices[primitive_index * 3 + 2];
+
+                    vec3 p = mesh.points[i];
+                    vec3 q = mesh.points[j];
+                    vec3 r = mesh.points[k];
+
+                    vec3 e0 = q - p;
+                    vec3 e1 = r - p;
+                    vec3 e2 = r - q;
+                    vec3 normal = cross(e0, e1);
+                    if (length(normal) / (dot(e0, e0) + dot(e1, e1) + dot(e2, e2)) < 1.e-6f)
+                        continue;
+
+                    vec2 bary = closest_point_to_triangle(p, q, r, point);
+                    float uu = bary[0];
+                    float vv = bary[1];
+                    float ww = 1.f - uu - vv;
+                    vec3 c = uu*p + vv*q + ww*r;
+                    float dist_sq = length_sq(c - point);
+                    if (dist_sq < min_dist_sq)
+                    {
+                        min_dist_sq = dist_sq;
+                        min_v = vv;
+                        min_w = ww;
+                        min_face = primitive_index;
+                    }
+                }
+                continue;
+            }
+            else
+            {
+                const int qbvh_idx = (int)tagged;
+                const QBVHNode n   = mesh.bvh.qbvh_nodes[qbvh_idx];
+                if (n.num_children == 0)
+                    continue;
+
+                uint32_t child_ids[QBVH_WIDTH];
+                float    dists[QBVH_WIDTH];
+                int      hits = 0;
+
+                // Precompute world-space scale once per node
+                vec3 scale(1.0f/n.inv_scale[0], 1.0f/n.inv_scale[1], 1.0f/n.inv_scale[2]);
+                for (int i = 0; i < n.num_children; ++i)
+                {
+                    vec3 cmin = n.min_point + vec3((float)n.qminx[i]*scale[0], (float)n.qminy[i]*scale[1], (float)n.qminz[i]*scale[2]);
+                    vec3 cmax = n.min_point + vec3((float)n.qmaxx[i]*scale[0], (float)n.qmaxy[i]*scale[1], (float)n.qmaxz[i]*scale[2]);
+
+                    float dsq = distance_to_aabb_sq(point, cmin, cmax);
+                    if (dsq <= min_dist_sq)
+                    {
+                        child_ids[hits] = n.children_idx[i];
+                        dists[hits]     = dsq;
+                        ++hits;
+                    }
+                }
+
+                // sort by increasing distance (small insertion sort)
+                for (int i = 1; i < hits; ++i)
+                {
+                    float    d = dists[i];
+                    uint32_t c = child_ids[i];
+                    int j = i - 1;
+                    while (j >= 0 && d < dists[j])
+                    {
+                        dists[j+1] = dists[j];
+                        child_ids[j+1] = child_ids[j];
+                        --j;
+                    }
+                    dists[j+1] = d;
+                    child_ids[j+1] = c;
+                }
+
+                // push in reverse so nearest is popped first
+                for (int i = hits-1; i >= 0; --i)
+                {
+                    if (count < BVH_QUERY_STACK_SIZE)
+                        stack[count++] = child_ids[i];
+                }
+            }
+        }
+
+        if (min_dist_sq < max_dist*max_dist)
+        {
+            u = 1.0f - min_v - min_w;
+            v = min_v;
+            face = min_face;
+            inside = mesh_query_inside(id, point);
+            return true;
+        }
+        return false;
+    }
+#endif
 
     int stack[BVH_QUERY_STACK_SIZE];
     stack[0] = *mesh.bvh.root;
@@ -312,6 +445,74 @@ CUDA_CALLABLE inline bool mesh_query_point(uint64_t id, const vec3& point, float
 CUDA_CALLABLE inline bool mesh_query_point_no_sign(uint64_t id, const vec3& point, float max_dist, int& face, float& u, float& v)
 {
     Mesh mesh = mesh_get(id);
+
+#if WP_ENABLE_QBVH
+    if (mesh.bvh.qbvh_nodes)
+    {
+        uint32_t stack[BVH_QUERY_STACK_SIZE];
+        int count = 0;
+        stack[count++] = (uint32_t)(*mesh.bvh.root);
+
+        float min_dist_sq = max_dist*max_dist;
+        int min_face = -1;
+        float min_v = 0.0f;
+        float min_w = 0.0f;
+
+        while (count)
+        {
+            const uint32_t tagged = stack[--count];
+            if (qbvh_is_leaf(tagged))
+            {
+                const int lbvh_idx = (int)qbvh_leaf_lbvh_index(tagged);
+                BVHPackedNodeHalf cL = bvh_load_node(mesh.bvh.node_lowers, lbvh_idx);
+                BVHPackedNodeHalf cU = bvh_load_node(mesh.bvh.node_uppers, lbvh_idx);
+                float node_dist_sq = distance_to_aabb_sq(point, vec3(cL.x, cL.y, cL.z), vec3(cU.x, cU.y, cU.z));
+                if (node_dist_sq > min_dist_sq) continue;
+
+                const int start = cL.i;
+                const int end   = cU.i;
+                for (int primitive_counter = start; primitive_counter < end; ++primitive_counter)
+                {
+                    int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
+                    int i = mesh.indices[primitive_index * 3 + 0];
+                    int j = mesh.indices[primitive_index * 3 + 1];
+                    int k = mesh.indices[primitive_index * 3 + 2];
+                    vec3 p = mesh.points[i];
+                    vec3 q = mesh.points[j];
+                    vec3 r = mesh.points[k];
+                    vec3 e0 = q - p; vec3 e1 = r - p; vec3 e2 = r - q;
+                    vec3 normal = cross(e0, e1);
+                    if (length(normal) / (dot(e0, e0) + dot(e1, e1) + dot(e2, e2)) < 1.e-6f) continue;
+                    vec2 bary = closest_point_to_triangle(p, q, r, point);
+                    float uu = bary[0], vv = bary[1], ww = 1.f - uu - vv;
+                    vec3 c = uu*p + vv*q + ww*r;
+                    float dist_sq = length_sq(c - point);
+                    if (dist_sq < min_dist_sq) { min_dist_sq = dist_sq; min_v = vv; min_w = ww; min_face = primitive_index; }
+                }
+                continue;
+            }
+            else
+            {
+                const int qbvh_idx = (int)tagged;
+                const QBVHNode n   = mesh.bvh.qbvh_nodes[qbvh_idx];
+                if (n.num_children == 0) continue;
+                uint32_t child_ids[QBVH_WIDTH]; float dists[QBVH_WIDTH]; int hits = 0;
+                vec3 scale(1.0f/n.inv_scale[0], 1.0f/n.inv_scale[1], 1.0f/n.inv_scale[2]);
+                for (int i = 0; i < n.num_children; ++i)
+                {
+                    vec3 cmin = n.min_point + vec3((float)n.qminx[i]*scale[0], (float)n.qminy[i]*scale[1], (float)n.qminz[i]*scale[2]);
+                    vec3 cmax = n.min_point + vec3((float)n.qmaxx[i]*scale[0], (float)n.qmaxy[i]*scale[1], (float)n.qmaxz[i]*scale[2]);
+                    float dsq = distance_to_aabb_sq(point, cmin, cmax);
+                    if (dsq <= min_dist_sq) { child_ids[hits] = n.children_idx[i]; dists[hits] = dsq; ++hits; }
+                }
+                for (int i = 1; i < hits; ++i) { float d = dists[i]; uint32_t c = child_ids[i]; int j = i-1; while (j>=0 && d < dists[j]) { dists[j+1]=dists[j]; child_ids[j+1]=child_ids[j]; --j; } dists[j+1]=d; child_ids[j+1]=c; }
+                for (int i = hits-1; i >= 0; --i) { if (count < BVH_QUERY_STACK_SIZE) stack[count++] = child_ids[i]; }
+            }
+        }
+        if (min_dist_sq < max_dist*max_dist) { u = 1.0f - min_v - min_w; v = min_v; face = min_face; return true; }
+        return false;
+    }
+#endif
 
     int stack[BVH_QUERY_STACK_SIZE];
     stack[0] = *mesh.bvh.root;
@@ -1373,6 +1574,108 @@ CUDA_CALLABLE inline bool mesh_query_ray(uint64_t id, const vec3& start, const v
 {
     Mesh mesh = mesh_get(id);
 
+#if WP_ENABLE_QBVH
+    if (mesh.bvh.qbvh_nodes)
+    {
+        uint32_t stack[BVH_QUERY_STACK_SIZE];
+        int count = 0;
+        stack[count++] = (uint32_t)(*mesh.bvh.root);
+
+        vec3 rcp_dir = vec3(1.0f/dir[0], 1.0f/dir[1], 1.0f/dir[2]);
+
+        float min_t = max_t;
+        int min_face = -1;
+        float min_u = 0.0f;
+        float min_v = 0.0f;
+        float min_sign = 1.0f;
+        vec3 min_normal;
+
+        while (count)
+        {
+            const uint32_t tagged = stack[--count];
+
+            if (qbvh_is_leaf(tagged))
+            {
+                const int lbvh_idx = (int)qbvh_leaf_lbvh_index(tagged);
+                BVHPackedNodeHalf cL = bvh_load_node(mesh.bvh.node_lowers, lbvh_idx);
+                BVHPackedNodeHalf cU = bvh_load_node(mesh.bvh.node_uppers, lbvh_idx);
+
+                float eps = 1.e-3f; float tnear = 0.0f;
+                bool hit = intersect_ray_aabb(start, rcp_dir,
+                    vec3(cL.x-eps, cL.y-eps, cL.z-eps), vec3(cU.x+eps, cU.y+eps, cU.z+eps), tnear);
+                if (!(hit && tnear < min_t))
+                    continue;
+
+                const int start_index = cL.i;
+                const int end_index   = cU.i;
+                for (int primitive_counter = start_index; primitive_counter < end_index ; primitive_counter++)
+                {
+                    int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
+                    int i0 = mesh.indices[primitive_index * 3 + 0];
+                    int i1 = mesh.indices[primitive_index * 3 + 1];
+                    int i2 = mesh.indices[primitive_index * 3 + 2];
+                    vec3 p = mesh.points[i0]; vec3 q = mesh.points[i1]; vec3 r = mesh.points[i2];
+                    float tt, uu, vv, ww, ss; vec3 n;
+                    if (intersect_ray_tri_rtcd(start, dir, p, q, r, tt, uu, vv, ww, ss, &n))
+                    {
+                        if (tt < min_t && tt >= 0.0f)
+                        {
+                            min_t = tt; min_face = primitive_index; min_u = uu; min_v = vv; min_sign = ss; min_normal = n;
+                        }
+                    }
+                }
+                continue;
+            }
+            else
+            {
+                const int qbvh_idx = (int)tagged;
+                const QBVHNode n   = mesh.bvh.qbvh_nodes[qbvh_idx];
+                if (n.num_children == 0)
+                    continue;
+
+                uint32_t child_ids[QBVH_WIDTH];
+                float    tvals[QBVH_WIDTH];
+                int      hits = 0;
+
+                vec3 scale(1.0f/n.inv_scale[0], 1.0f/n.inv_scale[1], 1.0f/n.inv_scale[2]);
+                for (int i = 0; i < n.num_children; ++i)
+                {
+                    vec3 cmin = n.min_point + vec3((float)n.qminx[i]*scale[0], (float)n.qminy[i]*scale[1], (float)n.qminz[i]*scale[2]);
+                    vec3 cmax = n.min_point + vec3((float)n.qmaxx[i]*scale[0], (float)n.qmaxy[i]*scale[1], (float)n.qmaxz[i]*scale[2]);
+                    float tnear = 0.0f; bool hit = intersect_ray_aabb(start, rcp_dir, cmin, cmax, tnear);
+                    if (hit && tnear < min_t)
+                    {
+                        child_ids[hits] = n.children_idx[i];
+                        tvals[hits]     = tnear;
+                        ++hits;
+                    }
+                }
+                if (hits == 0) continue;
+                for (int i = 1; i < hits; ++i)
+                {
+                    float    tt = tvals[i];
+                    uint32_t c  = child_ids[i];
+                    int j = i - 1;
+                    while (j >= 0 && tt < tvals[j])
+                    { tvals[j+1] = tvals[j]; child_ids[j+1] = child_ids[j]; --j; }
+                    tvals[j+1] = tt; child_ids[j+1] = c;
+                }
+                for (int i = hits - 1; i >= 0; --i)
+                {
+                    if (count < BVH_QUERY_STACK_SIZE)
+                        stack[count++] = child_ids[i];
+                }
+            }
+        }
+
+        if (min_t < max_t)
+        {
+            u = min_u; v = min_v; sign = min_sign; t = min_t; normal = normalize(min_normal); face = min_face; return true;
+        }
+        return false;
+    }
+#endif
+
     int stack[BVH_QUERY_STACK_SIZE];
     stack[0] = *mesh.bvh.root;
     int count = 1;
@@ -1668,6 +1971,79 @@ CUDA_CALLABLE inline void adj_mesh_query_aabb(uint64_t id, const vec3& lower, co
 CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& index)
 {
     Mesh mesh = query.mesh;
+
+#if WP_ENABLE_QBVH
+    if (mesh.bvh.qbvh_nodes)
+    {
+        while (query.count)
+        {
+            const uint32_t tagged = (uint32_t)query.stack[--query.count];
+
+            if (qbvh_is_leaf(tagged))
+            {
+                const int lbvh_idx = (int)qbvh_leaf_lbvh_index(tagged);
+                // Refine against exact LBVH leaf AABB
+                BVHPackedNodeHalf cL = bvh_load_node(mesh.bvh.node_lowers, lbvh_idx);
+                BVHPackedNodeHalf cU = bvh_load_node(mesh.bvh.node_uppers, lbvh_idx);
+                if (!intersect_aabb_aabb(query.input_lower, query.input_upper,
+                                         reinterpret_cast<vec3&>(cL), reinterpret_cast<vec3&>(cU)))
+                    continue;
+
+                const int start = cL.i;
+                const int end   = cU.i;
+
+                // Iterate primitives in this leaf; return one per call
+                const int local = query.primitive_counter < 0 ? 0 : query.primitive_counter;
+                for (int pc = local; pc < (end - start); ++pc)
+                {
+                    const int primitive_index = mesh.bvh.primitive_indices[start + pc];
+                    if (intersect_aabb_aabb(query.input_lower, query.input_upper,
+                                             mesh.lowers[primitive_index], mesh.uppers[primitive_index]))
+                    {
+                        index = primitive_index;
+                        query.face = primitive_index;
+                        // Prepare for next call within this leaf
+                        if (pc + 1 < (end - start))
+                        {
+                            query.primitive_counter = pc + 1;
+                            // keep current node on stack for further iteration
+                            query.stack[query.count++] = (int)tagged;
+                        }
+                        else
+                        {
+                            query.primitive_counter = -1;
+                        }
+                        return true;
+                    }
+                }
+                // finished this leaf, reset local state and continue
+                query.primitive_counter = -1;
+                continue;
+            }
+            else
+            {
+                const int qbvh_idx = (int)tagged;
+                const QBVHNode n   = mesh.bvh.qbvh_nodes[qbvh_idx];
+                if (n.num_children == 0)
+                    continue;
+
+                // Reconstruct world bounds and push overlapping children
+                vec3 scale(1.0f/n.inv_scale[0], 1.0f/n.inv_scale[1], 1.0f/n.inv_scale[2]);
+                for (int i = 0; i < n.num_children; ++i)
+                {
+                    vec3 cmin = n.min_point + vec3((float)n.qminx[i]*scale[0], (float)n.qminy[i]*scale[1], (float)n.qminz[i]*scale[2]);
+                    vec3 cmax = n.min_point + vec3((float)n.qmaxx[i]*scale[0], (float)n.qmaxy[i]*scale[1], (float)n.qmaxz[i]*scale[2]);
+                    if (intersect_aabb_aabb(query.input_lower, query.input_upper, cmin, cmax))
+                    {
+                        if (query.count < BVH_QUERY_STACK_SIZE)
+                            query.stack[query.count++] = (int)n.children_idx[i];
+                    }
+                }
+            }
+        }
+        return false;
+    }
+#endif
 
     // Navigate through the bvh, find the first overlapping leaf node.
     while (query.count)
