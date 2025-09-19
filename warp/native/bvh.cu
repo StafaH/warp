@@ -461,70 +461,105 @@ __global__ void mark_packed_leaf_nodes(int n,
     }
 }
 
-struct WidenTask
-{
-    uint32_t lbvh_node;
-    uint32_t qbvh_node;
-};
 
-__global__ void build_qbvh_from_lbvh(
+/*
+* Build the QBVH from the LBVH bottom-up to quickly populate all QBVH nodes at once
+*/
+__global__ void populate_qbvh(
+    int n,
     const BVHPackedNodeHalf* __restrict__ lowers,
     const BVHPackedNodeHalf* __restrict__ uppers,
+    QBVHNode* __restrict__ out_qnodes)
+{
+    int node_index = blockDim.x * blockIdx.x + threadIdx.x;
+    if (node_index < n)
+    {
+        const BVHPackedNodeHalf lower = bvh_load_node(lowers, node_index);
+        const BVHPackedNodeHalf upper = bvh_load_node(uppers, node_index);
+        QBVHNode n{};
+        
+        if (lower.b)
+        {
+            // Populate leaf
+            const float ex = fmaxf(upper.x - lower.x, 1e-6f);
+            const float ey = fmaxf(upper.y - lower.y, 1e-6f);
+            const float ez = fmaxf(upper.z - lower.z, 1e-6f);
+            n.min_point = vec3(lower.x, lower.y, lower.z);
+            n.inv_scale = vec3((float)QBVH_QUANT_MAX / ex,
+                               (float)QBVH_QUANT_MAX / ey,
+                               (float)QBVH_QUANT_MAX / ez);
+            n.qminx[0] = 0; n.qminy[0] = 0; n.qminz[0] = 0;
+            n.qmaxx[0] = QBVH_QUANT_MAX; n.qmaxy[0] = QBVH_QUANT_MAX; n.qmaxz[0] = QBVH_QUANT_MAX;
+            n.children_idx[0] = qbvh_leaf_node(node_index);
+            n.num_children = 1;
+            out_qnodes[node_index] = n;
+        }
+        else
+        {
+            // Populate internal node, we don't need to compute the bounds here
+            // because it will be computed during the widening process
+            n.num_children = 2;
+            n.children_idx[0] = lower.i;
+            n.children_idx[1] = upper.i;
+            out_qnodes[node_index] = n;
+        }
+    }
+}
+
+
+/*
+* Build the widened QBVH top down using 1 thread. For each LBVH node
+* we expand it into a QBVH node by expanding the internal nodes until we have <= QBVH_WIDTH children.
+* The index of the LBVH and QBVH trees are the same, so we can share indices while building.
+*/
+__global__ void build_widened_qbvh(
+    const BVHPackedNodeHalf* __restrict__ lowers,
+    const BVHPackedNodeHalf* __restrict__ uppers,
+    const uint64_t* __restrict__ keys,
+    const int* __restrict__ range_lefts,
+    const int* __restrict__ range_rights,
     const int* __restrict__ root,
     int max_nodes,
     QBVHNode* __restrict__ out_qnodes)
 {
-     // Start simple (single thread); you can parallelize per-world later.
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
 
     const int lbvh_root = *root;
-    printf("lbvh_root: %d\n", lbvh_root);
     if (lbvh_root < 0 || lbvh_root >= max_nodes) return;
 
-    // Work stack (DFS); pick a safe bound
-    const int kMaxWork = 4096; // or max_nodes, but keep it reasonable
-    WidenTask stack[kMaxWork];
+    // Since our nodes have a max depth of BVH_QUERY_STACK_SIZE, we can use a fixed-size stack
+    uint32_t __shared__ stack[4096];
     int sp = 0;
-
-    // Zero-init QBVH root (at the SAME index)
-    out_qnodes[lbvh_root] = QBVHNode{};
-    stack[sp++] = { (uint32_t)lbvh_root, (uint32_t)lbvh_root };
+    stack[sp++] = (uint32_t)lbvh_root;
 
     while (sp > 0) {
-        const WidenTask task = stack[--sp];
-        const uint32_t lbvh_idx = task.lbvh_node;
-        const uint32_t qbvh_idx = task.qbvh_node;
-        printf("widen task: lbvh_idx: %d, qbvh_idx: %d\n", lbvh_idx, qbvh_idx);
+        const uint32_t index = stack[--sp];
+
+        // Only widen nodes where the range is in the same group
+        bool single_group = true;
+        const uint64_t group_left = keys[range_lefts[index]] >> 32;
+        const uint64_t group_right = keys[range_rights[index]] >> 32;
+        single_group = (group_left == group_right);
+
+        if (!single_group)
+        {
+            // Add the children to the queue
+            stack[sp++] = lowers[index].i;
+            stack[sp++] = uppers[index].i;
+            continue;
+        }
 
         QBVHNode n{}; // zero-init
         
-        if (lowers[lbvh_idx].b) {
-            // Root is a leaf: emit one child referencing that leaf
-            const BVHPackedNodeHalf cL = lowers[lbvh_idx];
-            const BVHPackedNodeHalf cU = uppers[lbvh_idx];
-        
-            const float ex = fmaxf(cU.x - cL.x, 1e-6f);
-            const float ey = fmaxf(cU.y - cL.y, 1e-6f);
-            const float ez = fmaxf(cU.z - cL.z, 1e-6f);
-        
-            n.min_point = vec3(cL.x, cL.y, cL.z);
-            n.inv_scale = vec3((float)QBVH_QUANT_MAX / ex,
-                               (float)QBVH_QUANT_MAX / ey,
-                               (float)QBVH_QUANT_MAX / ez);
-        
-            n.qminx[0] = 0; n.qminy[0] = 0; n.qminz[0] = 0;
-            n.qmaxx[0] = QBVH_QUANT_MAX; n.qmaxy[0] = QBVH_QUANT_MAX; n.qmaxz[0] = QBVH_QUANT_MAX;
-            n.children_idx[0] = qbvh_leaf_node(lbvh_idx);
-            n.num_children = 1;
-        
-            out_qnodes[qbvh_idx] = n;
+        if (lowers[index].b) {
+            // The leafs have already been populated during the bottom-up build
             continue;
         }
 
         // Build child set by expanding internal LBVH nodes until we have <= W
         uint32_t queue[QBVH_WIDTH];
         int qsz = 0;
-        queue[qsz++] = lbvh_idx;
+        queue[qsz++] = index;
 
         for (;;) {
             if (qsz + 1 > QBVH_WIDTH) break; // no room to expand one internal -> two children
@@ -556,8 +591,8 @@ __global__ void build_qbvh_from_lbvh(
         float minx =  FLT_MAX, miny =  FLT_MAX, minz =  FLT_MAX;
         float maxx = -FLT_MAX, maxy = -FLT_MAX, maxz = -FLT_MAX;
         for (int i = 0; i < nchild; ++i) {
-            const BVHPackedNodeHalf cL = lowers[queue[i]];
-            const BVHPackedNodeHalf cU = uppers[queue[i]];
+            const BVHPackedNodeHalf cL = bvh_load_node(lowers, queue[i]);
+            const BVHPackedNodeHalf cU = bvh_load_node(uppers, queue[i]);
             minx = fminf(minx, cL.x);  miny = fminf(miny, cL.y);  minz = fminf(minz, cL.z);
             maxx = fmaxf(maxx, cU.x);  maxy = fmaxf(maxy, cU.y);  maxz = fmaxf(maxz, cU.z);
         }
@@ -575,8 +610,8 @@ __global__ void build_qbvh_from_lbvh(
         // Fill children
         for (int i = 0; i < nchild; ++i) {
             const uint32_t c = queue[i];
-            const BVHPackedNodeHalf cL = lowers[c];
-            const BVHPackedNodeHalf cU = uppers[c];
+            const BVHPackedNodeHalf cL = bvh_load_node(lowers, c);
+            const BVHPackedNodeHalf cU = bvh_load_node(uppers, c);
 
             // Conservative quantization
             const float qlx = (cL.x - minx) * n.inv_scale[0];
@@ -595,14 +630,11 @@ __global__ void build_qbvh_from_lbvh(
             } else {
                 // LBVH internal → QBVH child lives at SAME index 'c'
                 n.children_idx[i] = c;
-                // Ensure we will build that node (if not already visited). Here we just push;
-                // since we’re single-threaded DFS, no races.
-                out_qnodes[c] = QBVHNode{};          // zero-init
-                if (sp < kMaxWork) stack[sp++] = WidenTask{ c, c };
+                if (sp < max_nodes) stack[sp++] = c;
             }
         }
 
-        out_qnodes[qbvh_idx] = n;
+        out_qnodes[index] = n;
     }
 }
 
@@ -744,7 +776,8 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
     wp_launch_device(WP_CURRENT_CONTEXT, mark_packed_leaf_nodes, bvh.max_nodes, (bvh.max_nodes, range_lefts, range_rights, bvh.node_parents, bvh.keys, bvh.node_lowers, bvh.node_uppers));
 
 #ifdef WP_ENABLE_QBVH
-    wp_launch_device(WP_CURRENT_CONTEXT, build_qbvh_from_lbvh, 1, (bvh.node_lowers, bvh.node_uppers, bvh.root, bvh.max_nodes, bvh.qbvh_nodes));
+    wp_launch_device(WP_CURRENT_CONTEXT, populate_qbvh, bvh.max_nodes, (bvh.max_nodes, bvh.node_lowers, bvh.node_uppers, bvh.qbvh_nodes));
+    wp_launch_device(WP_CURRENT_CONTEXT, build_widened_qbvh, 1, (bvh.node_lowers, bvh.node_uppers, bvh.keys, range_lefts, range_rights, bvh.root, bvh.max_nodes, bvh.qbvh_nodes));
 #endif
 
     // free temporary memory
@@ -902,13 +935,6 @@ void bvh_create_device(void* context, vec3* lowers, vec3* uppers, int num_items,
         // node_counts is not allocated for host tree
         bvh_device_on_host.node_counts = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * bvh_device_on_host.max_nodes);
         wp::bvh_destroy_host(bvh_host);
-
-#ifdef WP_ENABLE_QBVH
-        // Build a QBVH on device for SAH/Median trees as well
-        bvh_device_on_host.qbvh_nodes = (QBVHNode*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(QBVHNode) * bvh_device_on_host.max_nodes);
-        wp_memset_device(WP_CURRENT_CONTEXT, bvh_device_on_host.qbvh_nodes, 0, sizeof(QBVHNode) * bvh_device_on_host.max_nodes);
-        wp_launch_device(WP_CURRENT_CONTEXT, build_qbvh_from_lbvh, 1, (bvh_device_on_host.node_lowers, bvh_device_on_host.node_uppers, bvh_device_on_host.root, bvh_device_on_host.max_nodes, bvh_device_on_host.qbvh_nodes));
-#endif
     }
     else if (constructor_type == BVH_CONSTRUCTOR_LBVH)
     {
