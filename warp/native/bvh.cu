@@ -476,33 +476,28 @@ __global__ void populate_qbvh(
     {
         const BVHPackedNodeHalf lower = bvh_load_node(lowers, node_index);
         const BVHPackedNodeHalf upper = bvh_load_node(uppers, node_index);
-        QBVHNode n{};
-        
-        if (lower.b)
-        {
-            // Populate leaf
-            const float ex = fmaxf(upper.x - lower.x, 1e-6f);
-            const float ey = fmaxf(upper.y - lower.y, 1e-6f);
-            const float ez = fmaxf(upper.z - lower.z, 1e-6f);
-            n.min_point = vec3(lower.x, lower.y, lower.z);
-            n.inv_scale = vec3((float)QBVH_QUANT_MAX / ex,
-                               (float)QBVH_QUANT_MAX / ey,
-                               (float)QBVH_QUANT_MAX / ez);
-            n.qminx[0] = 0; n.qminy[0] = 0; n.qminz[0] = 0;
-            n.qmaxx[0] = QBVH_QUANT_MAX; n.qmaxy[0] = QBVH_QUANT_MAX; n.qmaxz[0] = QBVH_QUANT_MAX;
-            n.children_idx[0] = qbvh_leaf_node(node_index);
-            n.num_children = 1;
-            out_qnodes[node_index] = n;
-        }
-        else
-        {
-            // Populate internal node, we don't need to compute the bounds here
-            // because it will be computed during the widening process
-            n.num_children = 2;
-            n.children_idx[0] = lower.i;
-            n.children_idx[1] = upper.i;
-            out_qnodes[node_index] = n;
-        }
+
+        QBVHNode nn{};
+        nn.children_idx[0] = lower.i;     // start (leaf-space) or left child
+        nn.children_idx[1] = upper.i;     // end   (leaf-space) or right child
+        nn.num_children = 2;
+
+        // conservative quant domain = this node's LBVH AABB
+        const float ex = fmaxf(upper.x - lower.x, 1e-6f);
+        const float ey = fmaxf(upper.y - lower.y, 1e-6f);
+        const float ez = fmaxf(upper.z - lower.z, 1e-6f);
+        nn.min_point = vec3(lower.x, lower.y, lower.z);
+        nn.inv_scale = vec3((float)QBVH_QUANT_MAX / ex,
+                            (float)QBVH_QUANT_MAX / ey,
+                            (float)QBVH_QUANT_MAX / ez);
+
+        // Fill qmins/qmaxs so AABB path is valid even before widening.
+        nn.qminx[0] = nn.qminy[0] = nn.qminz[0] = 0;
+        nn.qmaxx[0] = nn.qmaxy[0] = nn.qmaxz[0] = QBVH_QUANT_MAX;
+        nn.qminx[1] = nn.qminy[1] = nn.qminz[1] = 0;
+        nn.qmaxx[1] = nn.qmaxy[1] = nn.qmaxz[1] = QBVH_QUANT_MAX;
+
+        out_qnodes[node_index] = nn;
     }
 }
 
@@ -528,19 +523,22 @@ __global__ void build_widened_qbvh(
     if (lbvh_root < 0 || lbvh_root >= max_nodes) return;
 
     // Since our nodes have a max depth of BVH_QUERY_STACK_SIZE, we can use a fixed-size stack
-    uint32_t __shared__ stack[4096];
+    uint32_t stack[4096*8];
     int sp = 0;
     stack[sp++] = (uint32_t)lbvh_root;
 
     while (sp > 0) {
         const uint32_t index = stack[--sp];
-
+        
+        if (lowers[index].b) {
+            // The leafs have already been populated during the bottom-up build
+            continue;
+        }
         // Only widen nodes where the range is in the same group
         bool single_group = true;
         const uint64_t group_left = keys[range_lefts[index]] >> 32;
         const uint64_t group_right = keys[range_rights[index]] >> 32;
         single_group = (group_left == group_right);
-
         if (!single_group)
         {
             // Add the children to the queue
@@ -551,11 +549,6 @@ __global__ void build_widened_qbvh(
 
         QBVHNode n{}; // zero-init
         
-        if (lowers[index].b) {
-            // The leafs have already been populated during the bottom-up build
-            continue;
-        }
-
         // Build child set by expanding internal LBVH nodes until we have <= W
         uint32_t queue[QBVH_WIDTH];
         int qsz = 0;
@@ -630,7 +623,7 @@ __global__ void build_widened_qbvh(
             } else {
                 // LBVH internal → QBVH child lives at SAME index 'c'
                 n.children_idx[i] = c;
-                if (sp < max_nodes) stack[sp++] = c;
+                if (sp < 4096) stack[sp++] = c;
             }
         }
 
@@ -775,7 +768,7 @@ void LinearBVHBuilderGPU::build(BVH& bvh, const vec3* item_lowers, const vec3* i
     wp_launch_device(WP_CURRENT_CONTEXT, build_hierarchy, num_items, (num_items, bvh.root, deltas, bvh.keys, num_children, bvh.primitive_indices, range_lefts, range_rights, bvh.node_parents, bvh.node_lowers, bvh.node_uppers));
     wp_launch_device(WP_CURRENT_CONTEXT, mark_packed_leaf_nodes, bvh.max_nodes, (bvh.max_nodes, range_lefts, range_rights, bvh.node_parents, bvh.keys, bvh.node_lowers, bvh.node_uppers));
 
-#ifdef WP_ENABLE_QBVH
+#if WP_ENABLE_QBVH
     wp_launch_device(WP_CURRENT_CONTEXT, populate_qbvh, bvh.max_nodes, (bvh.max_nodes, bvh.node_lowers, bvh.node_uppers, bvh.qbvh_nodes));
     wp_launch_device(WP_CURRENT_CONTEXT, build_widened_qbvh, 1, (bvh.node_lowers, bvh.node_uppers, bvh.keys, range_lefts, range_rights, bvh.root, bvh.max_nodes, bvh.qbvh_nodes));
 #endif
@@ -905,8 +898,8 @@ void copy_host_tree_to_device(void* context, BVH& bvh_host, BVH& bvh_device_on_h
     bvh_device_on_host.primitive_indices = make_device_buffer_of(context, bvh_host.primitive_indices, bvh_host.num_items);
     bvh_device_on_host.keys = make_device_buffer_of(context, bvh_host.keys, bvh_host.num_items);
     // Ensure QBVH pointer is null by default; specific builders may allocate/populate it later
-#ifdef WP_ENABLE_QBVH
-    bvh_device_on_host.qbvh_nodes = nullptr;
+#if WP_ENABLE_QBVH
+    bvh_device_on_host.qbvh_nodes = make_device_buffer_of(context, bvh_host.qbvh_nodes, bvh_host.max_nodes);
 #endif
 }
 
@@ -956,7 +949,7 @@ void bvh_create_device(void* context, vec3* lowers, vec3* uppers, int num_items,
 
         bvh_device_on_host.context = context ? context : wp_cuda_context_get_current();
 
-#ifdef WP_ENABLE_QBVH
+#if WP_ENABLE_QBVH
         bvh_device_on_host.qbvh_nodes = (QBVHNode*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(QBVHNode) * bvh_device_on_host.max_nodes);
         wp_memset_device(WP_CURRENT_CONTEXT, bvh_device_on_host.qbvh_nodes, 0, sizeof(QBVHNode) * bvh_device_on_host.max_nodes);
 #endif
@@ -981,7 +974,7 @@ void bvh_destroy_device(BVH& bvh)
     wp_free_device(WP_CURRENT_CONTEXT, bvh.primitive_indices); bvh.primitive_indices = NULL;
     wp_free_device(WP_CURRENT_CONTEXT, bvh.keys); bvh.keys = NULL;
     wp_free_device(WP_CURRENT_CONTEXT, bvh.root); bvh.root = NULL;
-#ifdef WP_ENABLE_QBVH
+#if WP_ENABLE_QBVH
     wp_free_device(WP_CURRENT_CONTEXT, bvh.qbvh_nodes); bvh.qbvh_nodes = NULL;
 #endif
 }
