@@ -25,6 +25,14 @@
 
 #define BVH_DEBUG 0
 
+// Fallbacks for linter/static parsing when headers aren't included as a TU
+#ifndef BVH_QUERY_STACK_SIZE
+#define BVH_QUERY_STACK_SIZE (32)
+#endif
+#ifndef WP_BVH_BLOCK_DIM
+#define WP_BVH_BLOCK_DIM 256
+#endif
+
 namespace wp
 {
 
@@ -1369,13 +1377,64 @@ CUDA_CALLABLE inline void adj_mesh_query_point_sign_winding_number(uint64_t id, 
                                              adj_id, adj_point, adj_max_dist, adj_ret.sign, adj_ret.face, adj_ret.u, adj_ret.v, adj_accuracy, adj_winding_number_threshold, adj_ret.result);
 }
 
+
+#ifndef BVH_REG_STACK_SIZE
+#define BVH_REG_STACK_SIZE 16
+#endif
+
+
+// Hybrid register + shared-memory overflow stack
+// Keep most traversal in registers and spill excess to shared memory.
+// This reduces local memory spills while avoiding excessive shared usage.
+
+// // Ensure we have at least 1 slot for overflow on host-only compiles
+// struct BVHHybridStack {
+//     int reg_stack[BVH_REG_STACK_SIZE];
+//     uint8_t reg_count;
+//     int* overflow_stack;
+//     uint8_t overflow_count;
+    
+//     inline void init(int* overflow_ptr) {
+//         reg_count = 0;
+//         overflow_stack = overflow_ptr;
+//         overflow_count = 0;
+//     }
+    
+//     inline void push(int v) {
+//         if (reg_count < BVH_REG_STACK_SIZE) {
+//             reg_stack[reg_count++] = v;
+//         } else {
+//             overflow_stack[overflow_count++] = v;
+//         }
+//     }
+    
+//     inline bool pop(int& out) {
+//         if (reg_count > 0) {
+//             out = reg_stack[--reg_count];
+//             return true;
+//         } else if (overflow_count > 0) {
+//             out = overflow_stack[--overflow_count];
+//             return true;
+//         }
+//         return false;
+//     }
+// };
+
 CUDA_CALLABLE inline bool mesh_query_ray(uint64_t id, const vec3& start, const vec3& dir, float max_t, float& t, float& u, float& v, float& sign, vec3& normal, int& face)
 {
     Mesh mesh = mesh_get(id);
 
-    int stack[BVH_QUERY_STACK_SIZE];
-    stack[0] = *mesh.bvh.root;
-    int count = 1;
+#if defined(__CUDA_ARCH__)
+    __shared__ int bvh_overflow_mem[(BVH_QUERY_STACK_SIZE - BVH_REG_STACK_SIZE) * WP_BVH_BLOCK_DIM];
+    int* overflow_base = &bvh_overflow_mem[threadIdx.x * (BVH_QUERY_STACK_SIZE - BVH_REG_STACK_SIZE)];
+#else
+    int bvh_overflow_mem_host[(BVH_QUERY_STACK_SIZE > BVH_REG_STACK_SIZE ? (BVH_QUERY_STACK_SIZE - BVH_REG_STACK_SIZE) : 1)];
+    int* overflow_base = bvh_overflow_mem_host;
+#endif
+
+    bvh_hybrid_stack_t hstack;
+    hstack.init(overflow_base);
+    hstack.push(*mesh.bvh.root);
 
     vec3 rcp_dir = vec3(1.0f/dir[0], 1.0f/dir[1], 1.0f/dir[2]);
 
@@ -1386,31 +1445,31 @@ CUDA_CALLABLE inline bool mesh_query_ray(uint64_t id, const vec3& start, const v
     float min_sign = 1.0f;
     vec3 min_normal;
 
-    while (count)
+    const float eps = 1.e-3f;
+    float temp_t = 0.0f;
+    bool hit = false;
+
+    int nodeIndex;
+    while (hstack.pop(nodeIndex))
     {
-        const int nodeIndex = stack[--count];
 
         BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, nodeIndex);
         BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, nodeIndex);
 
         // todo: switch to robust ray-aabb, or expand bounds in build stage
-        float eps = 1.e-3f;
-        float t = 0.0f;
-        bool hit = intersect_ray_aabb(start, rcp_dir, vec3(lower.x-eps, lower.y-eps, lower.z-eps), vec3(upper.x+eps, upper.y+eps, upper.z+eps), t);
+        hit = intersect_ray_aabb(start, rcp_dir, vec3(lower.x-eps, lower.y-eps, lower.z-eps), vec3(upper.x+eps, upper.y+eps, upper.z+eps), temp_t);
 
-        if (hit && t < min_t)
+        if (hit && temp_t < min_t)
         {
-            const int left_index = lower.i;
-            const int right_index = upper.i;
-
             if (lower.b)
             {	
-                const int start_index = left_index;
-                const int end_index = right_index;
+                const int start_index = lower.i;
+                const int end_index = upper.i;
                 // loops through primitives in the leaf
                 for (int primitive_counter = start_index; primitive_counter < end_index ; primitive_counter++)
                 {
                     int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
+
                     int i = mesh.indices[primitive_index * 3 + 0];
                     int j = mesh.indices[primitive_index * 3 + 1];
                     int k = mesh.indices[primitive_index * 3 + 2];
@@ -1426,7 +1485,7 @@ CUDA_CALLABLE inline bool mesh_query_ray(uint64_t id, const vec3& start, const v
                     {
                         if (t < min_t && t >= 0.0f)
                         {
-                            min_t = t;
+                            min_t = temp_t;
                             min_face = primitive_index;
                             min_u = u;
                             min_v = v;
@@ -1438,8 +1497,8 @@ CUDA_CALLABLE inline bool mesh_query_ray(uint64_t id, const vec3& start, const v
             }
             else
             {
-                stack[count++] = left_index;
-                stack[count++] = right_index;
+                hstack.push(lower.i);
+                hstack.push(upper.i);
             }
         }
     }

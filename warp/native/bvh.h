@@ -39,6 +39,11 @@
 #define WP_BVH_BLOCK_DIM 256
 #endif
 
+// Default register stack size if not provided by the build
+#ifndef BVH_REG_STACK_SIZE
+#define BVH_REG_STACK_SIZE 16
+#endif
+
 namespace wp
 {
 
@@ -366,13 +371,50 @@ struct bvh_stack_t
 
 };
 
+#ifndef BVH_REG_STACK_SIZE
+#define BVH_REG_STACK_SIZE 16
+#endif
+
+// Ensure we have at least 1 slot for overflow on host-only compiles
+struct bvh_hybrid_stack_t {
+    int reg_stack[BVH_REG_STACK_SIZE];
+    uint8_t reg_count;
+    int* overflow_stack;
+    uint8_t overflow_count;
+    
+    inline void init(int* overflow_ptr) {
+        reg_count = 0;
+        overflow_stack = overflow_ptr;
+        overflow_count = 0;
+    }
+    
+    inline void push(int v) {
+        if (reg_count < BVH_REG_STACK_SIZE) {
+            reg_stack[reg_count++] = v;
+        } else {
+            overflow_stack[overflow_count++] = v;
+        }
+    }
+    
+    inline bool pop(int& out) {
+        if (reg_count > 0) {
+            out = reg_stack[--reg_count];
+            return true;
+        } else if (overflow_count > 0) {
+            out = overflow_stack[--overflow_count];
+            return true;
+        }
+        return false;
+    }
+};
+
 // stores state required to traverse the BVH nodes that 
 // overlap with a query AABB.
 struct bvh_query_t
 {
     CUDA_CALLABLE bvh_query_t()
         : bvh(),
-          stack(),
+          hstack(),
           count(0),
           is_ray(false),
           input_lower(),
@@ -390,11 +432,12 @@ struct bvh_query_t
     BVH bvh;
 
     // BVH traversal stack:
-#if BVH_SHARED_STACK
-    bvh_stack_t stack;
-#else
-    int stack[BVH_QUERY_STACK_SIZE];
-#endif
+// #if BVH_SHARED_STACK
+//     bvh_stack_t stack;
+// #else
+//     int stack[BVH_QUERY_STACK_SIZE];
+// #endif
+    bvh_hybrid_stack_t hstack;
     int count;
 
     // >= 0 if currently in a packed leaf node
@@ -429,9 +472,13 @@ CUDA_CALLABLE inline bvh_query_t bvh_query(
     // initialize empty
     bvh_query_t query;
 
-#if BVH_SHARED_STACK
-    __shared__ int stack[BVH_QUERY_STACK_SIZE*WP_BVH_BLOCK_DIM];
-    query.stack.ptr = &stack[threadIdx.x];
+    // Use hybrid register + shared-memory overflow stack for traversal
+#if defined(__CUDA_ARCH__)
+    __shared__ int bvh_overflow_mem[(BVH_QUERY_STACK_SIZE - BVH_REG_STACK_SIZE) * WP_BVH_BLOCK_DIM];
+    int* overflow_base = &bvh_overflow_mem[threadIdx.x * (BVH_QUERY_STACK_SIZE - BVH_REG_STACK_SIZE)];
+#else
+    int bvh_overflow_mem_host[(BVH_QUERY_STACK_SIZE > BVH_REG_STACK_SIZE ? (BVH_QUERY_STACK_SIZE - BVH_REG_STACK_SIZE) : 1)];
+    int* overflow_base = bvh_overflow_mem_host;
 #endif
 
     query.bounds_nr = -1;
@@ -440,17 +487,16 @@ CUDA_CALLABLE inline bvh_query_t bvh_query(
 
     query.bvh = bvh;
     query.is_ray = is_ray;
-
-	// optimization: make the latest	
-	query.stack[0] = root == -1 ? *bvh.root : root;
 	query.count = 1;
 	query.input_lower = lower;
 	query.input_upper = upper;
 
-    // Navigate through the bvh, find the first overlapping leaf node.
-    while (query.count)
+    query.hstack.init(overflow_base);
+    query.hstack.push(root == -1 ? *bvh.root : root);
+
+    int node_index;
+    while (query.hstack.pop(node_index))
     {
-        const int node_index = query.stack[--query.count];
         BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
         BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
 
@@ -463,19 +509,18 @@ CUDA_CALLABLE inline bvh_query_t bvh_query(
 
         const int left_index = node_lower.i;
         const int right_index = node_upper.i;
-        // Make bounds from this AABB
         if (node_lower.b)
         {
-            // Reached a leaf node, point to its first primitive
-            // Back up one level and return 
+            // Reached a leaf node, set state and return
             query.primitive_counter = 0;
-            query.stack[query.count++] = node_index;
+            query.count = 0;
+            query.hstack.push(node_index);
             return query;
         }
         else
         {
-            query.stack[query.count++] = left_index;
-            query.stack[query.count++] = right_index;
+            query.hstack.push(left_index);
+            query.hstack.push(right_index);
         }
     }
 
@@ -518,10 +563,9 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, float& 
     BVH bvh = query.bvh;
 
     // Navigate through the bvh, find the first overlapping leaf node.
-    while (query.count)
+    int node_index;
+    while (query.hstack.pop(node_index))
     {
-        const int node_index = query.stack[--query.count];
-
         BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
         BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
 
@@ -550,8 +594,8 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, float& 
         {
             // if it's not a leaf node we treat it as if we have visited the last primitive
             query.primitive_counter = 0;
-            query.stack[query.count++] = left_index;
-            query.stack[query.count++] = right_index;
+            query.hstack.push(left_index);
+            query.hstack.push(right_index);
         }
     }
     return false;
