@@ -22,6 +22,7 @@ from typing import TypeVar
 from typing import Generic
 from typing import Sequence
 from typing import overload as over
+from typing import Optional
 
 Length = TypeVar("Length", bound=int)
 Rows = TypeVar("Rows", bound=int)
@@ -3308,6 +3309,15 @@ def bvh_get_group_root(id: uint64, group: int32) -> int:
     ...
 
 @over
+def bvh_get_group_root(id: uint64, group: int) -> int:
+    """Get the root of a group in a BVH.
+    
+    :param id: The BVH identifier
+    :param group: The group identifier
+    """
+    ...
+
+@over
 def mesh_query_point(id: uint64, point: vec3f, max_dist: float32) -> MeshQueryPoint:
     """Computes the closest point on the :class:`Mesh` with identifier ``id`` to the given ``point`` in space.
 
@@ -3662,6 +3672,21 @@ def volume_index_to_world_dir(id: uint64, uvw: vec3f) -> vec3f:
 @over
 def volume_world_to_index_dir(id: uint64, xyz: vec3f) -> vec3f:
     """Transform a direction ``xyz`` defined in volume world space to the volume's index space given the volume's intrinsic affine transformation."""
+    ...
+
+@over
+def texture_sample_f(id: uint64, uv: vec2f) -> float:
+    """Sample a single-channel texture at normalized coordinates ``uv`` using linear filtering."""
+    ...
+
+@over
+def texture_sample_v3(id: uint64, uv: vec2f) -> vec3f:
+    """Sample a 3-channel texture at normalized coordinates ``uv`` using linear filtering."""
+    ...
+
+@over
+def texture_sample_v4(id: uint64, uv: vec2f) -> vec4f:
+    """Sample a 4-channel texture at normalized coordinates ``uv`` using linear filtering."""
     ...
 
 @over

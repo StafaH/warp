@@ -1042,6 +1042,9 @@ WP_API void wp_builtin_spatial_top_spatial_vectord(spatial_vectord& svec, vec3d*
 WP_API void wp_builtin_spatial_bottom_spatial_vectorh(spatial_vectorh& svec, vec3h* ret) { *ret = wp::spatial_bottom(svec); }
 WP_API void wp_builtin_spatial_bottom_spatial_vectorf(spatial_vectorf& svec, vec3f* ret) { *ret = wp::spatial_bottom(svec); }
 WP_API void wp_builtin_spatial_bottom_spatial_vectord(spatial_vectord& svec, vec3d* ret) { *ret = wp::spatial_bottom(svec); }
+WP_API void wp_builtin_texture_sample_f_uint64_vec2f(uint64 id, vec2f& uv, float* ret) { *ret = wp::texture_sample_f(id, uv); }
+WP_API void wp_builtin_texture_sample_v3_uint64_vec2f(uint64 id, vec2f& uv, vec3f* ret) { *ret = wp::texture_sample_v3(id, uv); }
+WP_API void wp_builtin_texture_sample_v4_uint64_vec2f(uint64 id, vec2f& uv, vec4f* ret) { *ret = wp::texture_sample_v4(id, uv); }
 WP_API void wp_builtin_volume_sample_f_uint64_vec3f_int32(uint64 id, vec3f& uvw, int32 sampling_mode, float* ret) { *ret = wp::volume_sample_f(id, uvw, sampling_mode); }
 WP_API void wp_builtin_volume_sample_grad_f_uint64_vec3f_int32_vec3f(uint64 id, vec3f& uvw, int32 sampling_mode, vec3f& grad, float* ret) { *ret = wp::volume_sample_grad_f(id, uvw, sampling_mode, grad); }
 WP_API void wp_builtin_volume_lookup_f_uint64_int32_int32_int32(uint64 id, int32 i, int32 j, int32 k, float* ret) { *ret = wp::volume_lookup_f(id, i, j, k); }

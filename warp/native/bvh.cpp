@@ -738,6 +738,7 @@ void bvh_create_host(vec3* lowers, vec3* uppers, int num_items, int constructor_
 
     bvh.item_lowers = lowers;
     bvh.item_uppers = uppers;
+    bvh.item_groups = groups;
     bvh.num_items = num_items;
     bvh.leaf_size = leaf_size;
 

@@ -4978,6 +4978,18 @@ add_builtin(
 )
 
 add_builtin(
+    "bvh_get_group_root",
+    input_types={"id": uint64, "group": int},
+    value_type=int,
+    group="Geometry",
+    doc="""Get the root of a group in a BVH.
+
+    :param id: The BVH identifier
+    :param group: The group identifier""",
+    export=False,
+)
+
+add_builtin(
     "mesh_query_point",
     input_types={
         "id": uint64,
@@ -5614,6 +5626,31 @@ add_builtin(
     doc="""Sample the volume of type `dtype` given by ``id`` at the volume local-space point ``uvw``.
 
     Interpolation should be :attr:`warp.Volume.CLOSEST` or :attr:`wp.Volume.LINEAR.`""",
+)
+
+
+add_builtin(
+    "texture_sample_f",
+    input_types={"id": uint64, "uv": vec2},
+    value_type=float,
+    group="Utility",
+    doc="""Sample a single-channel texture at normalized coordinates ``uv`` using linear filtering.""",
+)
+
+add_builtin(
+    "texture_sample_v3",
+    input_types={"id": uint64, "uv": vec2},
+    value_type=vec3,
+    group="Utility",
+    doc="""Sample a 3-channel texture at normalized coordinates ``uv`` using linear filtering.""",
+)
+
+add_builtin(
+    "texture_sample_v4",
+    input_types={"id": uint64, "uv": vec2},
+    value_type=vec4,
+    group="Utility",
+    doc="""Sample a 4-channel texture at normalized coordinates ``uv`` using linear filtering.""",
 )
 
 

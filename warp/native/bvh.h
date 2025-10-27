@@ -289,6 +289,80 @@ CUDA_CALLABLE inline int bvh_get_num_bounds(uint64_t id)
     return bvh.num_items;
 }
 
+CUDA_CALLABLE inline int lower_bound_group(const uint64_t* keys, int n, unsigned int group)
+{
+	uint64_t prefix = uint64_t(group) << 32;
+	int lo = 0;
+	int hi = n;
+	
+	while (lo < hi)
+	{
+    	int mid = (lo + hi) >> 1;
+		if (keys[mid] < prefix)
+		{
+			lo = mid + 1;
+		}
+		else
+		{
+			hi = mid;
+		}
+	}
+	
+	if (lo == n || (keys[lo] >> 32) != group) return -1;
+	
+	return lo;
+}
+
+
+CUDA_CALLABLE inline int lca(int node_a, int node_b, const int* parent)
+{
+	int da = 0, db = 0;
+    for (int t = node_a; t != -1; t = parent[t]) ++da;
+    for (int t = node_b; t != -1; t = parent[t]) ++db;
+
+	if (da > db) {
+        int diff = da - db;
+        while (diff-- && node_a != -1) node_a = parent[node_a];
+    } else if (db > da) {
+        int diff = db - da;
+        while (diff-- && node_b != -1) node_b = parent[node_b];
+    }
+
+	while (node_a != node_b) {
+        if (node_a == -1 || node_b == -1) return -1;
+        node_a = parent[node_a];
+        node_b = parent[node_b];
+    }
+    return node_a;  // either the LCA or -1
+}
+
+
+CUDA_CALLABLE inline int bvh_get_group_root(uint64_t id, int group_id)
+{
+	BVH bvh = bvh_get(id);
+	// locate first leaf of the current group
+	int first = lower_bound_group(bvh.keys, bvh.num_items, group_id);
+	if (first < 0) return -1;
+	
+	// find first leaf of next group to find the last leaf of the current group
+    int next = lower_bound_group(bvh.keys, bvh.num_items, group_id + 1);
+	int last = (next < 0 ? bvh.num_items : next) - 1;
+
+	// climb both until we meet
+	return lca(first, last, bvh.node_parents);
+}
+
+// represents a strided stack in shared memory
+// so each level of the stack is stored contiguously
+// across the block
+struct bvh_stack_t
+{
+    inline int operator[](int depth) const { return ptr[depth*WP_BVH_BLOCK_DIM]; }
+    inline int& operator[](int depth) { return ptr[depth*WP_BVH_BLOCK_DIM]; }
+
+    int* ptr;
+
+};
 
 CUDA_CALLABLE inline int lower_bound_group(const uint64_t *keys, int n, unsigned int group)
 {
@@ -416,7 +490,6 @@ struct bvh_query_t
 #else
     int stack[BVH_QUERY_STACK_SIZE];
 #endif
-
     int count;
 
     // >= 0 if currently in a packed leaf node
@@ -453,6 +526,11 @@ CUDA_CALLABLE inline bvh_query_t bvh_query(
     
 #if BVH_SHARED_STACK
     __shared__ int stack[BVH_QUERY_STACK_SIZE*WP_TILE_BLOCK_DIM];
+    query.stack.ptr = &stack[threadIdx.x];
+#endif
+
+#if BVH_SHARED_STACK
+    __shared__ int stack[BVH_QUERY_STACK_SIZE*WP_BVH_BLOCK_DIM];
     query.stack.ptr = &stack[threadIdx.x];
 #endif
 
