@@ -1418,14 +1418,19 @@ CUDA_CALLABLE inline bool mesh_query_ray(uint64_t id, const vec3& start, const v
                     vec3 q = mesh.points[j];
                     vec3 r = mesh.points[k];
 
-                    float t, u, v, w, sign;
+                    float local_t, u, v, w, sign;
                     vec3 n;
 
-                    if (intersect_ray_tri_rtcd(start, dir, p, q, r, t, u, v, w, sign, &n))
+                    if (intersect_ray_tri_rtcd(start, dir, p, q, r, local_t, u, v, w, sign, &n))
                     {
-                        if (t < min_t && t >= 0.0f)
+                        if (max_t < 0.0)
                         {
-                            min_t = t;
+                            min_t = local_t;
+                            return true;
+                        }
+                        if (local_t < min_t && local_t >= 0.0f)
+                        {
+                            min_t = local_t;
                             min_face = primitive_index;
                             min_u = u;
                             min_v = v;
@@ -1662,6 +1667,26 @@ CUDA_CALLABLE inline mesh_query_ray_t mesh_query_ray(uint64_t id, const vec3& st
     return query;
 }
 
+CUDA_CALLABLE inline mesh_query_ray_t mesh_query_ray_ordered(uint64_t id, const vec3& start, const vec3& dir, float max_t)
+{
+    mesh_query_ray_t query;
+    query.result = mesh_query_ray_ordered(id, start, dir, max_t, query.t, query.u, query.v, query.sign, query.normal, query.face);
+    return query;
+}
+
+// Backwards-compatibility alias for misspelled name used in some code paths
+CUDA_CALLABLE inline bool mesh_query_ray_orderered(
+    uint64_t id, const vec3& start, const vec3& dir, float max_t,
+    float& t, float& u, float& v, float& sign, vec3& normal, int& face)
+{
+    return mesh_query_ray_ordered(id, start, dir, max_t, t, u, v, sign, normal, face);
+}
+
+CUDA_CALLABLE inline mesh_query_ray_t mesh_query_ray_orderered(uint64_t id, const vec3& start, const vec3& dir, float max_t)
+{
+    return mesh_query_ray_ordered(id, start, dir, max_t);
+}
+
 CUDA_CALLABLE inline void
 adj_mesh_query_ray(
     uint64_t id, const vec3& start, const vec3& dir, float max_t, const mesh_query_ray_t& ret,
@@ -1672,6 +1697,38 @@ adj_mesh_query_ray(
         id, start, dir, max_t, ret.t, ret.u, ret.v, ret.sign, ret.normal, ret.face,
         adj_id, adj_start, adj_dir, adj_max_t, adj_ret.t, adj_ret.u, adj_ret.v, adj_ret.sign, adj_ret.normal, adj_ret.face, adj_ret.result
     );
+}
+
+// Ordered variants forward to the same adjoint as unordered (surface differential is identical)
+CUDA_CALLABLE inline void adj_mesh_query_ray_ordered(
+    uint64_t id, const vec3& start, const vec3& dir, float max_t, float t, float u, float v, float sign, const vec3& n, int face,
+    uint64_t adj_id, vec3& adj_start, vec3& adj_dir, float& adj_max_t, float& adj_t, float& adj_u, float& adj_v, float& adj_sign, vec3& adj_n, int& adj_face, bool& adj_ret)
+{
+    adj_mesh_query_ray(id, start, dir, max_t, t, u, v, sign, n, face,
+                       adj_id, adj_start, adj_dir, adj_max_t, adj_t, adj_u, adj_v, adj_sign, adj_n, adj_face, adj_ret);
+}
+
+CUDA_CALLABLE inline void adj_mesh_query_ray_ordered(
+    uint64_t id, const vec3& start, const vec3& dir, float max_t, const mesh_query_ray_t& ret,
+    uint64_t adj_id, vec3& adj_start, vec3& adj_dir, float& adj_max_t, mesh_query_ray_t& adj_ret)
+{
+    adj_mesh_query_ray(id, start, dir, max_t, ret, adj_id, adj_start, adj_dir, adj_max_t, adj_ret);
+}
+
+// Misspelled-variant adjoint aliases
+CUDA_CALLABLE inline void adj_mesh_query_ray_orderered(
+    uint64_t id, const vec3& start, const vec3& dir, float max_t, float t, float u, float v, float sign, const vec3& n, int face,
+    uint64_t adj_id, vec3& adj_start, vec3& adj_dir, float& adj_max_t, float& adj_t, float& adj_u, float& adj_v, float& adj_sign, vec3& adj_n, int& adj_face, bool& adj_ret)
+{
+    adj_mesh_query_ray_ordered(id, start, dir, max_t, t, u, v, sign, n, face,
+                               adj_id, adj_start, adj_dir, adj_max_t, adj_t, adj_u, adj_v, adj_sign, adj_n, adj_face, adj_ret);
+}
+
+CUDA_CALLABLE inline void adj_mesh_query_ray_orderered(
+    uint64_t id, const vec3& start, const vec3& dir, float max_t, const mesh_query_ray_t& ret,
+    uint64_t adj_id, vec3& adj_start, vec3& adj_dir, float& adj_max_t, mesh_query_ray_t& adj_ret)
+{
+    adj_mesh_query_ray_ordered(id, start, dir, max_t, ret, adj_id, adj_start, adj_dir, adj_max_t, adj_ret);
 }
 
 

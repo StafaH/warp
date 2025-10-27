@@ -4962,6 +4962,23 @@ add_builtin(
 )
 
 add_builtin(
+    "bvh_query_next_orderered",
+    input_types={"query": BvhQuery, "index": int, "max_dist": float},
+    defaults={"max_dist": math.inf},
+    value_type=builtins.bool,
+    group="Geometry",
+    doc="""Move to the next bound returned by the query, traversing near-first.
+
+    Same as :func:`bvh_query_next` but when walking the BVH pushes the child that is nearer along the ray first, so it tends to return nearer hits earlier for ray queries.
+
+    :param query: The query to move to the next bound
+    :param index: The index of the current bound
+    :param max_dist: The maximum distance along the ray to check for intersections for ray queries""",
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
     "bvh_get_group_root",
     input_types={"id": uint64, "group": int},
     value_type=int,
@@ -5310,6 +5327,99 @@ add_builtin(
     :param start: The start point of the ray
     :param dir: The ray direction (should be normalized)
     :param max_t: The maximum distance along the ray to check for intersections""",
+    require_original_output_arg=True,
+    export=False,
+)
+
+add_builtin(
+    "mesh_query_ray_ordered",
+    input_types={
+        "id": uint64,
+        "start": vec3,
+        "dir": vec3,
+        "max_t": float,
+        "t": float,
+        "bary_u": float,
+        "bary_v": float,
+        "sign": float,
+        "normal": vec3,
+        "face": int,
+    },
+    value_type=builtins.bool,
+    group="Geometry",
+    doc="""Computes the closest ray hit on the :class:`Mesh` with identifier ``id``, returns ``True`` if a hit < ``max_t`` is found.
+
+    Traverses the BVH in a near-first order so closer hits tend to be discovered earlier.
+
+    :param id: The mesh identifier
+    :param start: The start point of the ray
+    :param dir: The ray direction (should be normalized)
+    :param max_t: The maximum distance along the ray to check for intersections
+    :param t: Returns the distance of the closest hit along the ray
+    :param bary_u: Returns the barycentric u coordinate of the closest hit
+    :param bary_v: Returns the barycentric v coordinate of the closest hit
+    :param sign: Returns a value > 0 if the ray hit in front of the face, returns < 0 otherwise
+    :param normal: Returns the face normal
+    :param face: Returns the index of the hit face""",
+    export=False,
+    hidden=True,
+)
+
+add_builtin(
+    "mesh_query_ray_ordered",
+    input_types={
+        "id": uint64,
+        "start": vec3,
+        "dir": vec3,
+        "max_t": float,
+    },
+    value_type=MeshQueryRay,
+    group="Geometry",
+    doc="""Computes the closest ray hit on the :class:`Mesh` with identifier ``id``.
+
+    Traverses the BVH in a near-first order; signature and return type match :func:`mesh_query_ray` so it can be swapped easily.
+
+    :param id: The mesh identifier
+    :param start: The start point of the ray
+    :param dir: The ray direction (should be normalized)
+    :param max_t: The maximum distance along the ray to check for intersections""",
+    require_original_output_arg=True,
+    export=False,
+)
+
+# Backwards-compatibility alias matching misspelling in some user code
+add_builtin(
+    "mesh_query_ray_orderered",
+    input_types={
+        "id": uint64,
+        "start": vec3,
+        "dir": vec3,
+        "max_t": float,
+        "t": float,
+        "bary_u": float,
+        "bary_v": float,
+        "sign": float,
+        "normal": vec3,
+        "face": int,
+    },
+    value_type=builtins.bool,
+    group="Geometry",
+    doc="""Alias for :func:`mesh_query_ray_ordered` (near-first traversal).""",
+    export=False,
+    hidden=True,
+)
+
+add_builtin(
+    "mesh_query_ray_orderered",
+    input_types={
+        "id": uint64,
+        "start": vec3,
+        "dir": vec3,
+        "max_t": float,
+    },
+    value_type=MeshQueryRay,
+    group="Geometry",
+    doc="""Alias for :func:`mesh_query_ray_ordered` (near-first traversal).""",
     require_original_output_arg=True,
     export=False,
 )

@@ -453,7 +453,7 @@ __global__ void mark_packed_leaf_nodes(int n,
             single_group = (group_left == group_right);
         }
 
-        if (single_group && (right - left <= leaf_size || depth >= BVH_QUERY_STACK_SIZE))
+        if (single_group && (right - left <= leaf_size || depth >= BVH_QUERY_STACK_SIZE + 1))
         {
             lowers[node_index].b = 1;
             lowers[node_index].i = left;

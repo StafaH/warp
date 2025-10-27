@@ -3298,6 +3298,18 @@ def bvh_query_next(query: BvhQuery, index: int32, max_dist: float32) -> bool:
     ...
 
 @over
+def bvh_query_next_orderered(query: BvhQuery, index: int32, max_dist: float32) -> bool:
+    """Move to the next bound returned by the query, traversing near-first.
+
+    Same as :func:`bvh_query_next` but when walking the BVH pushes the child that is nearer along the ray first, so it tends to return nearer hits earlier for ray queries.
+
+    :param query: The query to move to the next bound
+    :param index: The index of the current bound
+    :param max_dist: The maximum distance along the ray to check for intersections for ray queries
+    """
+    ...
+
+@over
 def bvh_get_group_root(id: uint64, group: int32) -> int:
     """Get the root of a group in a BVH.
 
@@ -3401,6 +3413,24 @@ def mesh_query_ray(id: uint64, start: vec3f, dir: vec3f, max_t: float32) -> Mesh
     :param dir: The ray direction (should be normalized)
     :param max_t: The maximum distance along the ray to check for intersections
     """
+    ...
+
+@over
+def mesh_query_ray_ordered(id: uint64, start: vec3f, dir: vec3f, max_t: float32) -> MeshQueryRay:
+    """Computes the closest ray hit on the :class:`Mesh` with identifier ``id``.
+
+    Traverses the BVH in a near-first order. Signature and return type match :func:`mesh_query_ray` so it can be swapped easily.
+
+    :param id: The mesh identifier
+    :param start: The start point of the ray
+    :param dir: The ray direction (should be normalized)
+    :param max_t: The maximum distance along the ray to check for intersections
+    """
+    ...
+
+@over
+def mesh_query_ray_orderered(id: uint64, start: vec3f, dir: vec3f, max_t: float32) -> MeshQueryRay:
+    """Alias for :func:`mesh_query_ray_ordered` (near-first traversal)."""
     ...
 
 @over

@@ -517,7 +517,7 @@ int TopDownBVHBuilder::build_recursive(BVH& bvh, const vec3* lowers, const vec3*
 
     // If the depth exceeds BVH_QUERY_STACK_SIZE, an out-of-bounds access bug may occur during querying.
     // In that case, we merge the following nodes into a single large leaf node.
-    if (n <= bvh.leaf_size || depth >= BVH_QUERY_STACK_SIZE - 1)
+    if (n <= bvh.leaf_size || depth >= BVH_QUERY_STACK_SIZE + 1)
     {
         bvh.node_lowers[node_index] = make_node(b.lower, start, true);
         bvh.node_uppers[node_index] = make_node(b.upper, end, false);
@@ -587,7 +587,7 @@ int TopDownBVHBuilder::build_recursive_range(BVH& bvh, const vec3* lowers, const
 
     bounds3 b = calc_bounds(lowers, uppers, bvh.primitive_indices, start, end);
 
-    if (n <= bvh.leaf_size || depth >= BVH_QUERY_STACK_SIZE - 1)
+    if (n <= bvh.leaf_size || depth >= BVH_QUERY_STACK_SIZE + 1)
     {
         bvh.node_lowers[node_index] = make_node(b.lower, start, true);
         bvh.node_uppers[node_index] = make_node(b.upper, end, false);

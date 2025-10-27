@@ -5056,6 +5056,22 @@ Geometry
     :param max_dist: The maximum distance along the ray to check for intersections for ray queries
 
 
+.. py:function:: bvh_query_next_orderered(query: BvhQuery, index: int32, max_dist: float32) -> bool
+
+    .. hlist::
+       :columns: 8
+
+       * Kernel
+
+    Move to the next bound returned by the query, traversing near-first.
+
+    Same as :func:`bvh_query_next` but for ray queries, it prioritizes traversal of the child that is nearer along the ray direction, often returning closer hits earlier. For AABB queries, behavior is equivalent.
+
+    :param query: The query to move to the next bound
+    :param index: The index of the current bound
+    :param max_dist: The maximum distance along the ray to check for intersections for ray queries
+
+
 .. py:function:: bvh_get_group_root(id: uint64, group: int32) -> int
 
     .. hlist::
@@ -5182,6 +5198,22 @@ Geometry
        * Differentiable
 
     Computes the closest ray hit on the :class:`Mesh` with identifier ``id``.
+
+    :param id: The mesh identifier
+    :param start: The start point of the ray
+    :param dir: The ray direction (should be normalized)
+    :param max_t: The maximum distance along the ray to check for intersections
+
+.. py:function:: mesh_query_ray_ordered(id: uint64, start: vec3f, dir: vec3f, max_t: float32) -> MeshQueryRay
+
+    .. hlist::
+       :columns: 8
+
+       * Kernel
+
+    Computes the closest ray hit on the :class:`Mesh` with identifier ``id``.
+
+    Traverses the BVH in a near-first order; signature and return type match :func:`mesh_query_ray` so it can be swapped easily.
 
     :param id: The mesh identifier
     :param start: The start point of the ray
