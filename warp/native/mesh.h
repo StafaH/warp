@@ -83,6 +83,12 @@ CUDA_CALLABLE inline Mesh mesh_get(uint64_t id)
     return *(Mesh*)(id);
 }
 
+CUDA_CALLABLE inline int mesh_get_group_root(uint64_t id, int group_id)
+{
+    Mesh* mesh = (Mesh*)(id);
+    return bvh_get_group_root((uint64_t)&mesh->bvh, group_id);
+}
+
 
 CUDA_CALLABLE inline Mesh& operator += (Mesh& a, const Mesh& b) {
     // dummy operator needed for adj_select involving meshes
@@ -1369,13 +1375,13 @@ CUDA_CALLABLE inline void adj_mesh_query_point_sign_winding_number(uint64_t id, 
                                              adj_id, adj_point, adj_max_dist, adj_ret.sign, adj_ret.face, adj_ret.u, adj_ret.v, adj_accuracy, adj_winding_number_threshold, adj_ret.result);
 }
 
-CUDA_CALLABLE inline bool mesh_query_ray(uint64_t id, const vec3& start, const vec3& dir, float max_t, float& t, float& u, float& v, float& sign, vec3& normal, int& face)
+CUDA_CALLABLE inline bool mesh_query_ray(uint64_t id, const vec3& start, const vec3& dir, float max_t, float& t, float& u, float& v, float& sign, vec3& normal, int& face, int root = -1)
 {
     Mesh mesh = mesh_get(id);
 
     int stack[BVH_QUERY_STACK_SIZE];
 
-    stack[0] = *mesh.bvh.root;
+    stack[0] = root == -1 ? *mesh.bvh.root : root;
     int count = 1;
 
     vec3 rcp_dir = vec3(1.0f/dir[0], 1.0f/dir[1], 1.0f/dir[2]);
@@ -1468,14 +1474,14 @@ CUDA_CALLABLE inline void _swap(T& a, T& b)
     T t = a; a = b; b = t;
 }
 
-CUDA_CALLABLE inline bool mesh_query_ray_ordered(uint64_t id, const vec3& start, const vec3& dir, float max_t, float& t, float& u, float& v, float& sign, vec3& normal, int& face)
+CUDA_CALLABLE inline bool mesh_query_ray_ordered(uint64_t id, const vec3& start, const vec3& dir, float max_t, float& t, float& u, float& v, float& sign, vec3& normal, int& face, int root = -1)
 {
     Mesh mesh = mesh_get(id);
 
     int stack[BVH_QUERY_STACK_SIZE];
     float stack_dist[BVH_QUERY_STACK_SIZE];
 
-    stack[0] = *mesh.bvh.root;
+    stack[0] = root == -1 ? *mesh.bvh.root : root;
     stack_dist[0] = -FLT_MAX;
 
     int count = 1;
@@ -1595,13 +1601,13 @@ CUDA_CALLABLE inline bool mesh_query_ray_ordered(uint64_t id, const vec3& start,
     
 }
 
-CUDA_CALLABLE inline bool mesh_query_ray_anyhit(uint64_t id, const vec3& start, const vec3& dir, float max_t)
+CUDA_CALLABLE inline bool mesh_query_ray_anyhit(uint64_t id, const vec3& start, const vec3& dir, float max_t, int root = -1)
 {
     Mesh mesh = mesh_get(id);
 
     int stack[BVH_QUERY_STACK_SIZE];
 
-    stack[0] = *mesh.bvh.root;
+    stack[0] = root == -1 ? *mesh.bvh.root : root;
     int count = 1;
 
     vec3 rcp_dir = vec3(1.0f/dir[0], 1.0f/dir[1], 1.0f/dir[2]);
@@ -1660,8 +1666,8 @@ CUDA_CALLABLE inline bool mesh_query_ray_anyhit(uint64_t id, const vec3& start, 
 
 
 CUDA_CALLABLE inline void adj_mesh_query_ray(
-    uint64_t id, const vec3& start, const vec3& dir, float max_t, float t, float u, float v, float sign, const vec3& n, int face,
-    uint64_t adj_id, vec3& adj_start, vec3& adj_dir, float& adj_max_t, float& adj_t, float& adj_u, float& adj_v, float& adj_sign, vec3& adj_n, int& adj_face, bool& adj_ret)
+    uint64_t id, const vec3& start, const vec3& dir, float max_t, float t, float u, float v, float sign, const vec3& n, int face, int root,
+    uint64_t adj_id, vec3& adj_start, vec3& adj_dir, float& adj_max_t, float& adj_t, float& adj_u, float& adj_v, float& adj_sign, vec3& adj_n, int& adj_face, int& adj_root, bool& adj_ret)
 {
 
     Mesh mesh = mesh_get(id);
@@ -1682,16 +1688,20 @@ CUDA_CALLABLE inline void adj_mesh_query_ray(
 }
 
 CUDA_CALLABLE inline void adj_mesh_query_ray_ordered(
-    uint64_t id, const vec3& start, const vec3& dir, float max_t, float t, float u, float v, float sign, const vec3& n, int face,
-    uint64_t adj_id, vec3& adj_start, vec3& adj_dir, float& adj_max_t, float& adj_t, float& adj_u, float& adj_v, float& adj_sign, vec3& adj_n, int& adj_face, bool& adj_ret
+    uint64_t id, const vec3& start, const vec3& dir, float max_t, float t, float u, float v, float sign, const vec3& n, int face, int root,
+    uint64_t adj_id, vec3& adj_start, vec3& adj_dir, float& adj_max_t, float& adj_t, float& adj_u, float& adj_v, float& adj_sign, vec3& adj_n, int& adj_face, int& adj_root, bool& adj_ret
 )
 {   
 }
 
+CUDA_CALLABLE inline void adj_mesh_get_group_root(uint64_t id, int group_id, uint64_t&, int&, int&)
+{
+}
+
 CUDA_CALLABLE inline void
 adj_mesh_query_ray_anyhit(
-    uint64_t id, const vec3& start, const vec3& dir, float max_t, const bool& ret,
-    uint64_t adj_id, vec3& adj_start, vec3& adj_dir, float& adj_max_t, bool& adj_ret
+    uint64_t id, const vec3& start, const vec3& dir, float max_t, int root, const bool& ret,
+    uint64_t adj_id, vec3& adj_start, vec3& adj_dir, float& adj_max_t, int& adj_root, bool& adj_ret
 )
 {   
 }
@@ -1732,41 +1742,40 @@ struct mesh_query_ray_t
     bool result;
 };
 
-CUDA_CALLABLE inline mesh_query_ray_t mesh_query_ray(uint64_t id, const vec3& start, const vec3& dir, float max_t)
+CUDA_CALLABLE inline mesh_query_ray_t mesh_query_ray(uint64_t id, const vec3& start, const vec3& dir, float max_t, int root)
 {
     mesh_query_ray_t query;
-    query.result = mesh_query_ray(id, start, dir, max_t, query.t, query.u, query.v, query.sign, query.normal, query.face);
+    query.result = mesh_query_ray(id, start, dir, max_t, query.t, query.u, query.v, query.sign, query.normal, query.face, root);
     return query;
 }
 
-CUDA_CALLABLE inline mesh_query_ray_t mesh_query_ray_ordered(uint64_t id, const vec3& start, const vec3& dir, float max_t)
+CUDA_CALLABLE inline mesh_query_ray_t mesh_query_ray_ordered(uint64_t id, const vec3& start, const vec3& dir, float max_t, int root)
 {
     mesh_query_ray_t query;
-    query.result = mesh_query_ray_ordered(id, start, dir, max_t, query.t, query.u, query.v, query.sign, query.normal, query.face);
+    query.result = mesh_query_ray_ordered(id, start, dir, max_t, query.t, query.u, query.v, query.sign, query.normal, query.face, root);
     return query;
 }
 
 CUDA_CALLABLE inline void
 adj_mesh_query_ray(
-    uint64_t id, const vec3& start, const vec3& dir, float max_t, const mesh_query_ray_t& ret,
-    uint64_t adj_id, vec3& adj_start, vec3& adj_dir, float& adj_max_t, mesh_query_ray_t& adj_ret
+    uint64_t id, const vec3& start, const vec3& dir, float max_t, int root, const mesh_query_ray_t& ret,
+    uint64_t adj_id, vec3& adj_start, vec3& adj_dir, float& adj_max_t, mesh_query_ray_t& adj_ret, int& adj_root
 )
 {
     adj_mesh_query_ray(
-        id, start, dir, max_t, ret.t, ret.u, ret.v, ret.sign, ret.normal, ret.face,
-        adj_id, adj_start, adj_dir, adj_max_t, adj_ret.t, adj_ret.u, adj_ret.v, adj_ret.sign, adj_ret.normal, adj_ret.face, adj_ret.result
+        id, start, dir, max_t, ret.t, ret.u, ret.v, ret.sign, ret.normal, ret.face, root,
+        adj_id, adj_start, adj_dir, adj_max_t, adj_ret.t, adj_ret.u, adj_ret.v, adj_ret.sign, adj_ret.normal, adj_ret.face, adj_root, adj_ret.result
     );
 }
 
 CUDA_CALLABLE inline void
 adj_mesh_query_ray_ordered(
-    uint64_t id, const vec3& start, const vec3& dir, float max_t, const mesh_query_ray_t& ret,
-    uint64_t adj_id, vec3& adj_start, vec3& adj_dir, float& adj_max_t, mesh_query_ray_t& adj_ret
-)
+    uint64_t id, const vec3 &start, const vec3 &dir, float max_t, int root, const mesh_query_ray_t &ret,
+    uint64_t adj_id, vec3 &adj_start, vec3 &adj_dir, float &adj_max_t, int &adj_root, mesh_query_ray_t &adj_ret)
 {
     adj_mesh_query_ray_ordered(
-        id, start, dir, max_t, ret.t, ret.u, ret.v, ret.sign, ret.normal, ret.face,
-        adj_id, adj_start, adj_dir, adj_max_t, adj_ret.t, adj_ret.u, adj_ret.v, adj_ret.sign, adj_ret.normal, adj_ret.face, adj_ret.result
+        id, start, dir, max_t, ret.t, ret.u, ret.v, ret.sign, ret.normal, ret.face, root,
+        adj_id, adj_start, adj_dir, adj_max_t, adj_ret.t, adj_ret.u, adj_ret.v, adj_ret.sign, adj_ret.normal, adj_ret.face, adj_root, adj_ret.result
     );
 }
 
@@ -1782,7 +1791,7 @@ CUDA_CALLABLE inline float mesh_query_inside(uint64_t id, const vec3& p)
 
     for(int i = 0; i <3; ++i)
     {
-        if (mesh_query_ray(id, p, vec3(float(i==0), float(i==1), float(i==2)), FLT_MAX, t, u, v, sign, n, face) && sign < 0) 
+        if (mesh_query_ray(id, p, vec3(float(i==0), float(i==1), float(i==2)), FLT_MAX, t, u, v, sign, n, face, -1) && sign < 0) 
         {
             vote++;
         }
