@@ -1484,6 +1484,13 @@ CUDA_CALLABLE inline void adj_mesh_query_point_sign_winding_number(
     );
 }
 
+template <typename T> CUDA_CALLABLE inline void _swap(T& a, T& b)
+{
+    T t = a;
+    a = b;
+    b = t;
+}
+
 CUDA_CALLABLE inline bool mesh_query_ray(
     uint64_t id,
     const vec3& start,
@@ -1517,6 +1524,34 @@ CUDA_CALLABLE inline bool mesh_query_ray(
     float temp_t = 0.0f;
     bool hit = false;
 
+    // Compute the constants for woop triangle intersection test
+    float ax = fabsf(dir[0]);
+    float ay = fabsf(dir[1]);
+    float az = fabsf(dir[2]);
+
+    int kz;
+    if (ax > ay && ax > az)
+        kz = 0;
+    else if (ay > az)
+        kz = 1;
+    else
+        kz = 2;
+
+    int kx = kz + 1;
+    if (kx == 3)
+        kx = 0;
+    int ky = kx + 1;
+    if (ky == 3)
+        ky = 0;
+
+    if (dir[kz] < 0.0f) {
+        _swap(kx, ky);
+    }
+
+    float Sz = rcp_dir[kz];
+    float Sx = dir[kx] * Sz;
+    float Sy = dir[ky] * Sz;
+
     while (count) {
         const int node_index = stack[--count];
 
@@ -1547,7 +1582,10 @@ CUDA_CALLABLE inline bool mesh_query_ray(
                     float temp_t, temp_u, temp_v, temp_sign;
                     vec3 n;
 
-                    if (intersect_ray_tri_woop(start, dir, p, q, r, temp_t, temp_u, temp_v, temp_sign, &n)) {
+                    if (intersect_ray_tri_woop(
+                            start, kx, ky, kz, Sx, Sy, Sz, p, q, r, temp_t, temp_u, temp_v, temp_sign, n
+                        )) {
+
                         if (temp_t < min_t && temp_t >= 0.0f) {
                             min_t = temp_t;
                             min_face = primitive_index;
@@ -1596,6 +1634,36 @@ mesh_query_ray_anyhit(uint64_t id, const vec3& start, const vec3& dir, float max
     float temp_t = 0.0f;
     bool hit = false;
 
+    // Compute the constants for woop triangle intersection test
+    float ax = fabsf(dir[0]);
+    float ay = fabsf(dir[1]);
+    float az = fabsf(dir[2]);
+
+    int kz;
+    if (ax > ay && ax > az)
+        kz = 0;
+    else if (ay > az)
+        kz = 1;
+    else
+        kz = 2;
+
+    int kx = kz + 1;
+    if (kx == 3)
+        kx = 0;
+    int ky = kx + 1;
+    if (ky == 3)
+        ky = 0;
+
+    if (dir[kz] < 0.0f) {
+        int tmp = kx;
+        kx = ky;
+        ky = tmp;
+    }
+
+    float Sz = rcp_dir[kz];
+    float Sx = dir[kx] * Sz;
+    float Sy = dir[ky] * Sz;
+
     while (count) {
         const int node_index = stack[--count];
 
@@ -1626,7 +1694,10 @@ mesh_query_ray_anyhit(uint64_t id, const vec3& start, const vec3& dir, float max
                     float temp_t, temp_u, temp_v, temp_sign;
                     vec3 n;
 
-                    if (intersect_ray_tri_woop(start, dir, p, q, r, temp_t, temp_u, temp_v, temp_sign, &n)) {
+                    if (intersect_ray_tri_woop(
+                            start, kx, ky, kz, Sx, Sy, Sz, p, q, r, temp_t, temp_u, temp_v, temp_sign, n
+                        )) {
+
                         if (temp_t < max_t && temp_t >= 0.0f) {
                             return true;
                         }
@@ -1640,13 +1711,6 @@ mesh_query_ray_anyhit(uint64_t id, const vec3& start, const vec3& dir, float max
     }
 
     return false;
-}
-
-template <typename T> CUDA_CALLABLE inline void _swap(T& a, T& b)
-{
-    T t = a;
-    a = b;
-    b = t;
 }
 
 CUDA_CALLABLE inline bool mesh_query_ray_ordered(
@@ -1682,6 +1746,36 @@ CUDA_CALLABLE inline bool mesh_query_ray_ordered(
     float min_sign = 1.0f;
     vec3 min_normal;
 
+    // Compute the constants for woop triangle intersection test
+    float ax = fabsf(dir[0]);
+    float ay = fabsf(dir[1]);
+    float az = fabsf(dir[2]);
+
+    int kz;
+    if (ax > ay && ax > az)
+        kz = 0;
+    else if (ay > az)
+        kz = 1;
+    else
+        kz = 2;
+
+    int kx = kz + 1;
+    if (kx == 3)
+        kx = 0;
+    int ky = kx + 1;
+    if (ky == 3)
+        ky = 0;
+
+    if (dir[kz] < 0.0f) {
+        int tmp = kx;
+        kx = ky;
+        ky = tmp;
+    }
+
+    float Sz = rcp_dir[kz];
+    float Sx = dir[kx] * Sz;
+    float Sy = dir[ky] * Sz;
+
     while (count) {
         count -= 1;
 
@@ -1710,7 +1804,10 @@ CUDA_CALLABLE inline bool mesh_query_ray_ordered(
                     float temp_t, temp_u, temp_v, temp_sign;
                     vec3 n;
 
-                    if (intersect_ray_tri_woop(start, dir, p, q, r, temp_t, temp_u, temp_v, temp_sign, &n)) {
+                    if (intersect_ray_tri_woop(
+                            start, kx, ky, kz, Sx, Sy, Sz, p, q, r, temp_t, temp_u, temp_v, temp_sign, n
+                        )) {
+
                         if (temp_t < min_t && temp_t >= 0.0f) {
                             min_t = temp_t;
                             min_face = primitive_index;

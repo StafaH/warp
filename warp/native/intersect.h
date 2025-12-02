@@ -316,7 +316,12 @@ CUDA_CALLABLE inline float diff_product(float a, float b, float c, float d)
 // http://jcgt.org/published/0002/01/05/
 CUDA_CALLABLE inline bool intersect_ray_tri_woop(
     const vec3& p,
-    const vec3& dir,
+    const int kx,
+    const int ky,
+    const int kz,
+    const float Sx,
+    const float Sy,
+    const float Sz,
     const vec3& a,
     const vec3& b,
     const vec3& c,
@@ -324,31 +329,9 @@ CUDA_CALLABLE inline bool intersect_ray_tri_woop(
     float& u,
     float& v,
     float& sign,
-    vec3* normal
+    vec3& normal
 )
 {
-    // todo: precompute for ray
-
-    int kz = max_dim(dir);
-    int kx = kz + 1;
-    if (kx == 3)
-        kx = 0;
-    int ky = kx + 1;
-    if (ky == 3)
-        ky = 0;
-
-    if (dir[kz] < 0.0f) {
-        int tmp = kx;
-        kx = ky;
-        ky = tmp;
-    }
-
-    float Sx = dir[kx] / dir[kz];
-    float Sy = dir[ky] / dir[kz];
-    float Sz = 1.0f / dir[kz];
-
-    // todo: end precompute
-
     const vec3 A = a - p;
     const vec3 B = b - p;
     const vec3 C = c - p;
@@ -404,14 +387,10 @@ CUDA_CALLABLE inline bool intersect_ray_tri_woop(
     t = T * rcpDet;
     sign = det;
 
-    // optionally write out normal (todo: this branch is a performance concern, should probably remove)
-    if (normal) {
-        const vec3 ab = b - a;
-        const vec3 ac = c - a;
-
-        // calculate normal
-        *normal = cross(ab, ac);
-    }
+    // calculate normal without conditional branch
+    const vec3 ab = b - a;
+    const vec3 ac = c - a;
+    normal = cross(ab, ac);
 
     return true;
 }
@@ -441,9 +420,20 @@ CUDA_CALLABLE inline void adj_intersect_ray_tri_woop(
 )
 {
 
-    // todo: precompute for ray
+    // precompute Woop ray constants (same pattern as forward pass)
 
-    int kz = max_dim(dir);
+    float ax = fabsf(dir[0]);
+    float ay = fabsf(dir[1]);
+    float az = fabsf(dir[2]);
+
+    int kz;
+    if (ax > ay && ax > az)
+        kz = 0;
+    else if (ay > az)
+        kz = 1;
+    else
+        kz = 2;
+
     int kx = kz + 1;
     if (kx == 3)
         kx = 0;
@@ -461,11 +451,9 @@ CUDA_CALLABLE inline void adj_intersect_ray_tri_woop(
     const float Dy = dir[ky];
     const float Dz = dir[kz];
 
-    const float Sx = dir[kx] / dir[kz];
-    const float Sy = dir[ky] / dir[kz];
-    const float Sz = 1.0f / dir[kz];
-
-    // todo: end precompute
+    const float Sz = 1.0f / Dz;
+    const float Sx = Dx * Sz;
+    const float Sy = Dy * Sz;
 
     const vec3 A = a - p;
     const vec3 B = b - p;
