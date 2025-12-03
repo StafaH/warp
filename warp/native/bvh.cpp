@@ -43,16 +43,7 @@ private:
     void initialize_empty(BVH& bvh);
 
     bounds3 calc_bounds(const vec3* lowers, const vec3* uppers, const int* indices, int start, int end);
-    int build_recursive(
-        BVH& bvh,
-        const vec3* lowers,
-        const vec3* uppers,
-        int start,
-        int end,
-        int depth,
-        int parent,
-        int assigned_node = -1
-    );
+    int build_recursive(BVH& bvh, const vec3* lowers, const vec3* uppers, int start, int end, int depth, int parent);
     int
     partition_median(const vec3* lowers, const vec3* uppers, int* indices, int start, int end, bounds3 range_bounds);
     int
@@ -213,9 +204,36 @@ void TopDownBVHBuilder::build_with_groups(BVH& bvh, const vec3* lowers, const ve
             continue;
         int prim_start = bvh.node_lowers[node].i;
         int prim_end = bvh.node_uppers[node].i;
+        const int parent = bvh.node_parents[node];
+
         // Replace this packed leaf with a full subtree over [prim_start, prim_end)
+        // To ensure that the leaves will be appended in ascending group order, we
+        // build zero out this node and build the tree in the node frontier.
+        // Starting the subtree in-place would lead to a leaf node being made here,
+        // if for this group the primitives are <= leaf_size
+        // The leaf nodes being in ascending group order is crucial for finding the
+        // group root node
+        int new_root = build_recursive(bvh, lowers, uppers, prim_start, prim_end, 0, parent);
+
+        // Update the parent of this node to jump directly to the new subtree root
+        // ignoring this node
+        if (parent >= 0) {
+            if (bvh.node_lowers[parent].i == node) {
+                bvh.node_lowers[parent].i = new_root;
+            } else {
+                bvh.node_uppers[parent].i = new_root;
+            }
+        } else {
+            *bvh.root = new_root;
+        }
+
+        group_leaf_node_index[g] = new_root;
+
+        // Mark the old group leaf node as deleted so it is skipped during reordering.
         bvh.node_lowers[node].b = 0;
-        build_recursive(bvh, lowers, uppers, prim_start, prim_end, 0, bvh.node_parents[node], node);
+        bvh.node_lowers[node].i = 0;
+        bvh.node_uppers[node].i = 0;
+        bvh.node_parents[node] = -1;
     }
 
     // 5. Reorder the tree so that all the leaf nodes are stored in the front
@@ -242,6 +260,8 @@ void TopDownBVHBuilder::build(
         return;
     }
 
+    const int max_nodes_multiplier = (groups) ? 3 : 2;
+
     if (n < 0) {
         fprintf(stderr, "Error: Cannot build BVH with a negative primitive count: %d\n", n);
         initialize_empty(bvh);
@@ -249,14 +269,14 @@ void TopDownBVHBuilder::build(
     } else if (n == 0) {
         initialize_empty(bvh);
         return;
-    } else if (n > INT_MAX / 2) {
+    } else if (n > INT_MAX / max_nodes_multiplier) {
         fprintf(stderr, "Error: Primitive count %d is too large and would cause an integer overflow.\n", n);
         initialize_empty(bvh);
         return;
     }
 
     bvh.max_depth = 0;
-    bvh.max_nodes = 2 * n - 1;
+    bvh.max_nodes = max_nodes_multiplier * n - 1;
 
     bvh.node_lowers = new BVHPackedNodeHalf[bvh.max_nodes];
     bvh.node_uppers = new BVHPackedNodeHalf[bvh.max_nodes];
@@ -518,18 +538,16 @@ float TopDownBVHBuilder::partition_sah_indices(
 
 
 int TopDownBVHBuilder::build_recursive(
-    BVH& bvh, const vec3* lowers, const vec3* uppers, int start, int end, int depth, int parent, int assigned_node
+    BVH& bvh, const vec3* lowers, const vec3* uppers, int start, int end, int depth, int parent
 )
 {
-    // Build subtree over [start,end). If assigned_node >= 0,
-    // reuse that node index instead of allocating a new one.
+    // Build subtree over [start,end).
     assert(start < end);
 
     const int n = end - start;
-    const int node_index = (assigned_node >= 0) ? assigned_node : bvh.num_nodes++;
+    const int node_index = bvh.num_nodes++;
 
-    if (assigned_node < 0)
-        assert(node_index < bvh.max_nodes);
+    assert(node_index < bvh.max_nodes);
 
     if (depth > bvh.max_depth)
         bvh.max_depth = depth;

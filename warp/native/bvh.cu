@@ -530,6 +530,8 @@ void LinearBVHBuilderGPU::build(
     BVH& bvh, const vec3* item_lowers, const vec3* item_uppers, int num_items, bounds3* total_bounds, int* item_groups
 )
 {
+    const int required_nodes = 2 * num_items - 1;
+
     // allocate temporary memory used during  building
     indices = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * num_items * 2);  // *2 for radix sort
     keys = (uint64_t*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(uint64_t) * num_items * 2);  // *2 for radix sort
@@ -608,10 +610,13 @@ void LinearBVHBuilderGPU::build(
          bvh.node_parents, bvh.node_lowers, bvh.node_uppers)
     );
     wp_launch_device(
-        WP_CURRENT_CONTEXT, mark_packed_leaf_nodes, bvh.max_nodes,
-        (bvh.max_nodes, range_lefts, range_rights, bvh.node_parents, keys, bvh.node_lowers, bvh.node_uppers,
+        WP_CURRENT_CONTEXT, mark_packed_leaf_nodes, required_nodes,
+        (required_nodes, range_lefts, range_rights, bvh.node_parents, keys, bvh.node_lowers, bvh.node_uppers,
          bvh.leaf_size)
     );
+
+    bvh.num_nodes = required_nodes;
+    bvh.num_leaf_nodes = num_items;
 
     // free temporary memory
     wp_free_device(WP_CURRENT_CONTEXT, indices);
