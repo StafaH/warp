@@ -395,9 +395,11 @@ CUDA Memory Management
    CudaManagedAllocator
    MemoryKind
    ScopedAllocator
+   ScopedCaptureScratch
    ScopedMempool
    ScopedMempoolAccess
    ScopedPeerAccess
+   VirtualMemory
    get_cuda_max_cluster_dim
    get_device_allocator
    get_mempool_release_threshold

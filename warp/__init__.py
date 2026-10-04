@@ -425,6 +425,8 @@ from warp._src.context import is_peer_access_supported as is_peer_access_support
 from warp._src.context import is_peer_access_enabled as is_peer_access_enabled
 from warp._src.context import set_peer_access_enabled as set_peer_access_enabled
 
+from warp._src.context import VirtualMemory as VirtualMemory
+from warp._src.context import ScopedCaptureScratch as ScopedCaptureScratch
 from warp._src.context import MemoryKind as MemoryKind
 from warp._src.context import Allocator as Allocator
 from warp._src.context import CudaManagedAllocator as CudaManagedAllocator

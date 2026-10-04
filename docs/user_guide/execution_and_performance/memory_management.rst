@@ -995,3 +995,68 @@ allocation or access pattern to create:
 Prefer capability checks over platform-name checks. They make code portable
 across discrete GPUs, HMM-enabled systems, Jetson, Grace, and future coherent
 CPU/GPU platforms.
+
+
+CUDA Virtual Memory
+-------------------
+
+:class:`VirtualMemory` reserves a contiguous CUDA virtual address range without
+backing the entire range with physical memory. :meth:`VirtualMemory.commit` maps
+zero-initialized physical pages into a growing prefix while keeping the base
+pointer stable. Reservation and commitment sizes are rounded to the device's
+minimum mapping granularity, exposed as ``granularity``. Small independent
+reservations each pay this page-rounding cost.
+
+.. code-block:: python
+
+    storage = wp.VirtualMemory(1 << 30, device="cuda", initial_size=4096)
+    values = storage.array((1 << 30) // 4, dtype=wp.float32)
+    # Kernel accesses must be guarded by an active count that fits committed_size.
+    # Between graph replays, grow physical backing without changing values.ptr:
+    storage.commit(1 << 20)
+
+Commitment is a synchronous host operation and is forbidden during graph
+capture. It cannot be called from a GPU kernel or automatically triggered by
+access to an uncommitted address. A captured graph can continue using the same
+array pointer after growth; its launch dimensions and array shape remain fixed.
+Use a device-side active count to guard accesses, and update that count only
+after commitment has completed.
+
+``array()`` can expose a shape larger than the committed prefix so guarded
+kernels can be captured once. Ordinary operations such as ``numpy()``, ``fill_()``,
+and ``zero_()`` access the entire view. Create a view whose shape fits the
+committed prefix for these operations. Access to uncommitted addresses is invalid.
+
+Array views retain the reservation. Keep their owner alive for the lifetime of
+any CUDA graphs or external tensor views that use the pointer. Explicit
+``close()`` rejects outstanding Warp array views. The prototype supports local
+CUDA device access only; it does not configure peer mappings, CUDA IPC,
+concurrent host mutations, physical-memory reclamation, or automatic demand faults.
+
+
+Preallocated Capture Scratch
+----------------------------
+
+CUDA conditional graph bodies cannot contain allocation or free nodes.
+:class:`ScopedCaptureScratch` supplies already allocated storage to both Warp
+arrays and native temporary allocations while capturing, allowing allocation-heavy
+callbacks to be placed inside :func:`capture_if`.
+
+.. code-block:: python
+
+    storage = wp.empty(16 << 20, dtype=wp.uint8, device="cuda")
+    scratch = wp.ScopedCaptureScratch(storage)
+    with scratch:
+        with wp.ScopedCapture() as capture:
+            wp.capture_if(enabled, on_true=simulation_step)
+
+Warp arrays and captured graphs retain the scratch owner after scope exit.
+``scratch.used_bytes`` reports the bump offset including alignment. Scope entry
+does not reset that offset. ``scratch.rewind()`` can reuse it while constructing
+mutually exclusive branches or ordered phases, provided their temporaries cannot
+overlap at execution time. Rewind is not a replay-time allocation operation.
+
+The backing buffer must be fully committed. Use ``ScopedStream`` when capturing
+on an alternate stream. APIC recording and concurrent graph execution over one
+scratch buffer are unsupported. Temporary contents must not be used as persistent
+application state when their bytes are reused.

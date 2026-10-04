@@ -1,0 +1,1 @@
+Add a prototype `ScopedCaptureScratch` allocator that uses preallocated CUDA storage for Warp arrays and native temporary buffers while constructing conditional graphs, with retained graph ownership and explicit capture-time reuse.

@@ -171,6 +171,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_block_dim_dispatch import TestBlockDimDispatch
     from warp.tests.test_bool import TestBool
     from warp.tests.test_builtins_resolution import TestBuiltinsResolution
+    from warp.tests.test_capture_scratch import TestCaptureScratch
     from warp.tests.test_closest_point_edge_edge import TestClosestPointEdgeEdgeMethods
     from warp.tests.test_codegen import TestCodeGen
     from warp.tests.test_codegen_instancing import TestCodeGenInstancing
@@ -190,6 +191,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_dense import TestDense
     from warp.tests.test_devices import TestDevices
     from warp.tests.test_diagnostics import TestDiagnostics
+    from warp.tests.test_dynamic_table import TestDynamicTable
     from warp.tests.test_enum import TestEnum
     from warp.tests.test_examples import (
         TestCoreExamples,
@@ -267,6 +269,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_vec_scalar_ops import TestVecScalarOps
     from warp.tests.test_verify_fp import TestVerifyFP
     from warp.tests.test_version import TestVersion
+    from warp.tests.test_virtual_memory import TestVirtualMemory
     from warp.tests.tile.test_tile import TestTile
     from warp.tests.tile.test_tile_atomic_bitwise import TestTileAtomicBitwise
     from warp.tests.tile.test_tile_block_dim_mismatch import TestTileBlockDimMismatch
@@ -345,6 +348,9 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestCTypes,
         TestCudaArchSuffix,
         TestCudaProfiler,
+        TestVirtualMemory,
+        TestCaptureScratch,
+        TestDynamicTable,
         TestCustomAllocator,
         TestDelaunay,
         TestDense,

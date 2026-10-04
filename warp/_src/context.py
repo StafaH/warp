@@ -5160,6 +5160,126 @@ class Module:
 # execution context
 
 
+class VirtualMemory:
+    """Reserve CUDA virtual addresses and grow zero-initialized physical backing in place.
+
+    ``commit()`` runs on the host between graph replays. It synchronizes the CUDA context
+    before mapping pages and rejects active graph capture. A captured kernel may use a view
+    of the entire reservation and a device-side active count, provided every memory access
+    stays within the committed prefix. Ordinary array operations (including ``zero_()`` and
+    ``numpy()``) touch the whole view, so use a committed-length view for those operations.
+
+    Arrays retain this object. Keep arrays or this object alive while captured graphs or
+    external tensor views use their pointers, following normal Warp graph lifetime rules.
+    This primitive provides local-device storage; peer access and CUDA IPC are unsupported.
+    Host operations on the same reservation must not run concurrently.
+
+    Args:
+        size_in_bytes: Maximum usable byte size, rounded up to the CUDA mapping granularity.
+        device: CUDA device on which to reserve and commit memory.
+        initial_size: Number of bytes to commit initially.
+    """
+
+    def __init__(self, size_in_bytes: int, device: DeviceLike = "cuda", initial_size: int = 0):
+        self._handle = None
+        self._views = []
+        self.device = get_device(device)
+        if not self.device.is_cuda:
+            raise ValueError("VirtualMemory requires a CUDA device")
+        size_in_bytes = operator.index(size_in_bytes)
+        initial_size = operator.index(initial_size)
+        if size_in_bytes <= 0 or size_in_bytes > (1 << (8 * ctypes.sizeof(ctypes.c_size_t))) - 1:
+            raise ValueError("size_in_bytes must be a positive native size_t value")
+        if initial_size < 0 or initial_size > size_in_bytes:
+            raise ValueError("initial_size must be between zero and size_in_bytes")
+        self._check_capture()
+        ptr = ctypes.c_void_p()
+        reserved = ctypes.c_size_t()
+        granularity = ctypes.c_size_t()
+        self._handle = runtime.core.wp_virtual_memory_create(
+            self.device.context, size_in_bytes, ctypes.byref(ptr), ctypes.byref(reserved), ctypes.byref(granularity)
+        )
+        if not self._handle:
+            raise RuntimeError(f"Failed to reserve CUDA virtual memory: {runtime.get_error_string()}")
+        self.ptr = ptr.value
+        """Base address, unchanged by ``commit()``."""
+        self.reserved_size = reserved.value
+        """Reserved virtual bytes, including page rounding."""
+        self.granularity = granularity.value
+        """CUDA mapping page size in bytes."""
+        self.committed_size = 0
+        """Bytes currently backed by physical device memory, including page rounding."""
+        if initial_size:
+            self.commit(initial_size)
+
+    def _check_capture(self):
+        if self.device.is_capturing:
+            raise RuntimeError("Cannot mutate CUDA virtual memory during graph capture")
+
+    def _check_open(self):
+        if not self._handle:
+            raise RuntimeError("VirtualMemory is closed")
+
+    def commit(self, size_in_bytes: int):
+        """Ensure a prefix has physical backing, retaining its data and base address.
+
+        Newly mapped pages are zero-initialized. Shrinking the requested prefix does not
+        release memory. This operation synchronizes all work on the CUDA context.
+        """
+        self._check_open()
+        self._check_capture()
+        size_in_bytes = operator.index(size_in_bytes)
+        if size_in_bytes < 0 or size_in_bytes > self.reserved_size:
+            raise ValueError("Commit size must be between zero and reserved_size")
+        if not runtime.core.wp_virtual_memory_commit(self._handle, size_in_bytes):
+            raise RuntimeError(f"Failed to commit CUDA virtual memory: {runtime.get_error_string()}")
+        rounded = ((size_in_bytes + self.granularity - 1) // self.granularity) * self.granularity
+        self.committed_size = max(self.committed_size, rounded)
+
+    def array(self, shape: int | tuple[int, ...], dtype=warp._src.types.float32, offset: int = 0):
+        """Return a contiguous zero-copy array view, retaining this reservation.
+
+        ``shape`` may span uncommitted addresses for guarded kernels. Accessing an
+        uncommitted address is invalid; this class does not provide GPU page fault handling.
+        ``offset`` is measured in bytes and must be a multiple of the element size.
+        """
+        self._check_open()
+        offset = operator.index(offset)
+        dtype = warp._src.types.type_to_warp(dtype)
+        element_size = warp._src.types.type_size_in_bytes(dtype)
+        shape = (operator.index(shape),) if isinstance(shape, int) else tuple(operator.index(n) for n in shape)
+        warp._src.types.check_array_shape(shape)
+        size = math.prod(shape) * element_size
+        if offset < 0 or offset % element_size:
+            raise ValueError("offset must be a nonnegative multiple of the element size")
+        if offset + size > self.reserved_size:
+            raise ValueError("Array view exceeds the virtual memory reservation")
+        view = warp._src.types.array(ptr=self.ptr + offset, shape=shape, dtype=dtype, device=self.device)
+        view._ref = self
+        self._views = [ref for ref in self._views if ref() is not None]
+        self._views.append(weakref.ref(view))
+        return view
+
+    def close(self):
+        """Release the reservation after its views and captured users have been discarded."""
+        if not self._handle:
+            return
+        self._check_capture()
+        if any(ref() is not None for ref in self._views):
+            raise RuntimeError("Cannot close VirtualMemory while array views are alive")
+        if not runtime.core.wp_virtual_memory_destroy(self._handle, False):
+            raise RuntimeError(f"Failed to release CUDA virtual memory: {runtime.get_error_string()}")
+        self._handle = None
+        self.ptr = None
+        self.committed_size = 0
+
+    def __del__(self):
+        if self._handle:
+            # Destruction during Warp capture is queued by native deferred cleanup.
+            if runtime.core.wp_virtual_memory_destroy(self._handle, True):
+                self._handle = None
+
+
 @runtime_checkable
 class Allocator(Protocol):
     """Protocol for custom memory allocators.
@@ -5211,6 +5331,120 @@ class MemoryKind(enum.IntEnum):
 
     CUDA_MANAGED = 5
     """CUDA managed-memory allocation."""
+
+
+_capture_scratch_local = threading.local()
+
+
+class ScopedCaptureScratch:
+    """Suballocate capture-time temporary storage from a preallocated CUDA buffer.
+
+    Both Warp array allocations and native scratch allocations on a capturing stream
+    use the buffer while this scope is active. Arrays retain the allocator, and Warp
+    graphs retain it for native temporary pointer lifetime. No physical allocation is
+    performed during replay. Ordinary CUDA capture is supported; APIC is unsupported.
+
+    The buffer must be fully backed by physical memory. Scopes and graphs sharing a
+    buffer must not execute concurrently. ``rewind()`` may reuse bytes only between
+    mutually exclusive branches or ordered phases whose temporaries do not overlap.
+    The scope changes the device's allocator; concurrent host allocation on that device
+    is unsupported. Do not use capture scratch for application state that must persist
+    between phases.
+
+    Args:
+        buffer: Contiguous one-dimensional CUDA uint8 array providing committed storage.
+    """
+
+    memory_kind = MemoryKind.CUDA_DEVICE
+    deallocate_requires_context_guard = False
+
+    def __init__(self, buffer):
+        self._handle = None
+        self._entered = False
+        if not isinstance(buffer, warp._src.types.array) or not buffer.device.is_cuda:
+            raise ValueError("Capture scratch requires a CUDA array")
+        if buffer.dtype is not warp._src.types.uint8 or buffer.ndim != 1 or not buffer.is_contiguous or not buffer.size:
+            raise ValueError("Capture scratch requires a nonempty contiguous one-dimensional uint8 array")
+        self.buffer = buffer
+        self.device = buffer.device
+        self.memory_kind = buffer.memory_kind
+        if not hasattr(runtime.core, "wp_capture_scratch_create"):
+            raise RuntimeError("Capture scratch requires rebuilding the Warp native library")
+        self._handle = runtime.core.wp_capture_scratch_create(self.device.context, buffer.ptr, buffer.size)
+        if not self._handle:
+            raise RuntimeError(f"Failed to create capture scratch arena: {runtime.get_error_string()}")
+
+    @property
+    def used_bytes(self):
+        """Current capture-time bump offset, including alignment padding."""
+        return runtime.core.wp_capture_scratch_used(self._handle)
+
+    def _retain_in_graphs(self):
+        for graph in self.device.captures.values():
+            if self not in graph._capture_scratch_refs:
+                graph._capture_scratch_refs.append(self)
+
+    def __enter__(self):
+        if self._entered:
+            raise RuntimeError("Capture scratch scopes are not reentrant")
+        if _get_apic_capture_for_device(self.device) is not None:
+            raise RuntimeError("Capture scratch does not support APIC recording")
+        if not runtime.core.wp_capture_scratch_begin(self._handle):
+            raise RuntimeError(runtime.get_error_string())
+        self._saved_allocator = self.device._custom_allocator
+        self._previous = getattr(_capture_scratch_local, "arena", None)
+        try:
+            self.device._custom_allocator = self
+            _capture_scratch_local.arena = self
+            self._entered = True
+            self._retain_in_graphs()
+        except Exception:
+            self.device._custom_allocator = self._saved_allocator
+            _capture_scratch_local.arena = self._previous
+            self._entered = False
+            runtime.core.wp_capture_scratch_end(self._handle)
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.device._custom_allocator = self._saved_allocator
+        _capture_scratch_local.arena = self._previous
+        self._entered = False
+        ended = runtime.core.wp_capture_scratch_end(self._handle)
+        if exc_type is None:
+            if not ended:
+                raise RuntimeError(runtime.get_error_string())
+            if runtime.core.wp_capture_scratch_exhausted(self._handle):
+                raise RuntimeError("Capture scratch arena was exhausted while recording the graph")
+
+    def allocate(self, size_in_bytes):
+        if _get_apic_capture_for_device(self.device) is not None:
+            raise RuntimeError("Capture scratch does not support APIC recording")
+        ptr = runtime.core.wp_capture_scratch_alloc(self._handle, size_in_bytes)
+        if not ptr:
+            raise RuntimeError(f"Failed to suballocate capture scratch: {runtime.get_error_string()}")
+        self._retain_in_graphs()
+        return ptr
+
+    def deallocate(self, ptr, size_in_bytes):
+        # Array-owned suballocations hold this allocator, hence the entire buffer.
+        pass
+
+    def rewind(self):
+        """Reuse storage at capture construction time for mutually exclusive/ordered phases.
+
+        This is a host operation while constructing the graph, not a replay-time reset.
+        Previously captured users of these bytes must finish before subsequent users run.
+        """
+        if not runtime.core.wp_capture_scratch_rewind(self._handle):
+            raise RuntimeError(runtime.get_error_string())
+
+    def __del__(self):
+        try:
+            if self._handle:
+                runtime.core.wp_capture_scratch_destroy(self._handle)
+        except (AttributeError, TypeError):
+            pass
 
 
 _LAUNCH_ARRAY_ACCESS_WARNING_CACHE_SIZE = 1024
@@ -6374,6 +6608,7 @@ class Graph:
         self.capture_id = capture_id
         self.module_execs: set[ModuleExec] = set()
         self._deterministic_buffer_refs: list[Any] = []
+        self._capture_scratch_refs: list[Any] = []
         self.graph_exec: ctypes.c_void_p | None = None
         self.graph: ctypes.c_void_p | None = None
 
@@ -6433,6 +6668,11 @@ class Graph:
             pass
 
     # retain executable CUDA modules used by this graph, which prevents them from being unloaded
+    def _retain_capture_scratch(self, source):
+        for owner in source._capture_scratch_refs:
+            if owner not in self._capture_scratch_refs:
+                self._capture_scratch_refs.append(owner)
+
     def _retain_module_exec(self, module_exec: ModuleExec):
         self.module_execs.add(module_exec)
 
@@ -6699,6 +6939,29 @@ class Runtime:
             self.core.wp_alloc_device_async.restype = ctypes.c_void_p
             self.core.wp_alloc_device_managed.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
             self.core.wp_alloc_device_managed.restype = ctypes.c_void_p
+            self.core.wp_virtual_memory_create.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_size_t),
+            ]
+            self.core.wp_virtual_memory_create.restype = ctypes.c_void_p
+            self.core.wp_virtual_memory_commit.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            self.core.wp_virtual_memory_commit.restype = ctypes.c_bool
+            self.core.wp_virtual_memory_destroy.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+            self.core.wp_virtual_memory_destroy.restype = ctypes.c_bool
+            if hasattr(self.core, "wp_capture_scratch_create"):
+                self.core.wp_capture_scratch_create.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+                self.core.wp_capture_scratch_create.restype = ctypes.c_void_p
+                for name in ("destroy", "begin", "end", "exhausted", "rewind"):
+                    func = getattr(self.core, f"wp_capture_scratch_{name}")
+                    func.argtypes = [ctypes.c_void_p]
+                    func.restype = ctypes.c_bool
+                self.core.wp_capture_scratch_alloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+                self.core.wp_capture_scratch_alloc.restype = ctypes.c_void_p
+                self.core.wp_capture_scratch_used.argtypes = [ctypes.c_void_p]
+                self.core.wp_capture_scratch_used.restype = ctypes.c_size_t
 
             self.core.wp_float_to_half_bits.argtypes = [ctypes.c_float]
             self.core.wp_float_to_half_bits.restype = ctypes.c_uint16
@@ -13200,6 +13463,9 @@ def capture_begin(
         return
 
     # ---- CUDA capture path ----
+    capture_scratch = getattr(_capture_scratch_local, "arena", None)
+    if capture_scratch is not None and capture_scratch.device == device and apic:
+        raise RuntimeError("Capture scratch does not support APIC recording")
     if force_module_load is None:
         if runtime.driver_version is not None and runtime.driver_version >= (12, 3):
             # Driver versions 12.3 and can compile modules during graph capture
@@ -13246,6 +13512,8 @@ def capture_begin(
 
     capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
     graph = Graph(device, capture_id)
+    if capture_scratch is not None and capture_scratch.device == device:
+        graph._capture_scratch_refs.append(capture_scratch)
 
     # Attach APIC capture state if recording
     if apic_capture is not None:
@@ -13685,6 +13953,7 @@ def capture_if(
             if isinstance(on_true, Callable):
                 on_true(**kwargs)
             elif isinstance(on_true, Graph):
+                main_graph._retain_capture_scratch(on_true)
                 if not runtime.core.wp_cuda_graph_insert_child_graph(
                     device.context,
                     stream.cuda_stream,
@@ -13713,6 +13982,7 @@ def capture_if(
             if isinstance(on_false, Callable):
                 on_false(**kwargs)
             elif isinstance(on_false, Graph):
+                main_graph._retain_capture_scratch(on_false)
                 if not runtime.core.wp_cuda_graph_insert_child_graph(
                     device.context,
                     stream.cuda_stream,
@@ -13898,6 +14168,7 @@ def capture_while(condition: warp.array[int], while_body: Callable | Graph, stre
         if isinstance(while_body, Callable):
             while_body(**kwargs)
         elif isinstance(while_body, Graph):
+            main_graph._retain_capture_scratch(while_body)
             if not runtime.core.wp_cuda_graph_insert_child_graph(
                 device.context,
                 stream.cuda_stream,
@@ -14018,6 +14289,10 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
     else:
         device = graph.device
         stream = device.stream
+
+    parent_graph = device.captures.get(stream)
+    if parent_graph is not None:
+        parent_graph._retain_capture_scratch(graph)
 
     if graph.graph_exec is None:
         g = ctypes.c_void_p()

@@ -73,6 +73,18 @@ WP_API void* wp_alloc_device_default(void* context, size_t s, const char* tag = 
 WP_API void*
 wp_alloc_device_async(void* context, size_t s, void* stream = WP_CURRENT_STREAM, const char* tag = nullptr);
 WP_API void* wp_alloc_device_managed(void* context, size_t s, const char* tag = nullptr);
+WP_API void* wp_virtual_memory_create(void* context, size_t size, void** ptr, size_t* reserved, size_t* granularity);
+WP_API bool wp_virtual_memory_commit(void* allocation, size_t size);
+WP_API bool wp_virtual_memory_destroy(void* allocation, bool defer = false);
+
+WP_API void* wp_capture_scratch_create(void* context, void* ptr, size_t capacity);
+WP_API bool wp_capture_scratch_destroy(void* arena);
+WP_API bool wp_capture_scratch_begin(void* arena);
+WP_API bool wp_capture_scratch_end(void* arena);
+WP_API void* wp_capture_scratch_alloc(void* arena, size_t size);
+WP_API size_t wp_capture_scratch_used(void* arena);
+WP_API bool wp_capture_scratch_exhausted(void* arena);
+WP_API bool wp_capture_scratch_rewind(void* arena);
 
 WP_API void wp_free_host(void* ptr);
 WP_API void wp_free_pinned(void* ptr);

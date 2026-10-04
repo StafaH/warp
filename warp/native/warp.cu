@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <iterator>
 #include <list>
 #include <map>
@@ -230,6 +231,7 @@ static std::unordered_map<void*, GraphAllocInfo> g_graph_allocs;
 // Memory that cannot be freed immediately gets queued here.
 // Call free_deferred_allocs() to release.
 static std::vector<FreeInfo> g_deferred_free_list;
+static std::vector<void*> g_deferred_virtual_memory;
 
 // Modules that cannot be unloaded immediately get queued here.
 // Call unload_deferred_modules() to release.
@@ -694,6 +696,16 @@ static int run_deferred_actions(void* context = NULL)
 {
     int num_actions = 0;
     num_actions += free_deferred_allocs(context);
+    if (g_captures.empty()) {
+        for (auto it = g_deferred_virtual_memory.begin(); it != g_deferred_virtual_memory.end();) {
+            if (wp_virtual_memory_destroy(*it, false)) {
+                it = g_deferred_virtual_memory.erase(it);
+                ++num_actions;
+            } else {
+                ++it;
+            }
+        }
+    }
     num_actions += unload_deferred_modules(context);
     num_actions += destroy_deferred_graphs(context);
     num_actions += process_deferred_graph_destroy_callbacks(context);
@@ -749,6 +761,288 @@ void wp_free_pinned(void* ptr)
     cudaFreeHost(ptr);
 }
 
+// CUDA virtual memory keeps the address stable while physical backing grows.
+// Mapping is a host operation at a synchronized boundary, never a graph node.
+struct VirtualMemoryAllocation {
+    void* context;
+    CUdeviceptr ptr;
+    size_t reserved;
+    size_t granularity;
+    size_t committed = 0;
+    CUmemAllocationProp prop;
+    std::vector<std::pair<size_t, size_t>> mappings;
+};
+
+static bool virtual_memory_mutation_allowed(void* context)
+{
+    if (!g_captures.empty() || wp_cuda_stream_is_capturing(wp_cuda_context_get_stream(context))) {
+        wp::set_error_string("Cannot mutate CUDA virtual memory during graph capture");
+        return false;
+    }
+    return true;
+}
+
+void* wp_virtual_memory_create(void* context, size_t size, void** ptr, size_t* reserved, size_t* granularity)
+{
+    ContextGuard guard(context);
+    if (!virtual_memory_mutation_allowed(context))
+        return NULL;
+
+    CUdevice device;
+    if (!check_cu(cuCtxGetDevice_f(&device)))
+        return NULL;
+    int supported = 0;
+    if (!check_cu(cuDeviceGetAttribute_f(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, device)))
+        return NULL;
+    if (!supported) {
+        wp::set_error_string("CUDA device does not support virtual memory management");
+        return NULL;
+    }
+
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device;
+    size_t page_size;
+    if (!check_cu(cuMemGetAllocationGranularity_f(&page_size, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM)))
+        return NULL;
+    if (!size || size > SIZE_MAX - (page_size - 1)) {
+        wp::set_error_string("Invalid CUDA virtual memory reservation size");
+        return NULL;
+    }
+    size_t rounded_size = ((size + page_size - 1) / page_size) * page_size;
+    auto* allocation = new (std::nothrow) VirtualMemoryAllocation;
+    if (!allocation) {
+        wp::set_error_string("Failed to allocate CUDA virtual memory metadata");
+        return NULL;
+    }
+    if (!check_cu(cuMemAddressReserve_f(&allocation->ptr, rounded_size, page_size, 0, 0))) {
+        delete allocation;
+        return NULL;
+    }
+    allocation->context = context;
+    allocation->reserved = rounded_size;
+    allocation->granularity = page_size;
+    allocation->prop = prop;
+    *ptr = reinterpret_cast<void*>(allocation->ptr);
+    *reserved = rounded_size;
+    *granularity = page_size;
+    return allocation;
+}
+
+bool wp_virtual_memory_commit(void* allocation_, size_t size)
+{
+    auto* allocation = static_cast<VirtualMemoryAllocation*>(allocation_);
+    ContextGuard guard(allocation->context);
+    if (!virtual_memory_mutation_allowed(allocation->context))
+        return false;
+    if (size > allocation->reserved) {
+        wp::set_error_string("CUDA virtual memory commit exceeds reservation");
+        return false;
+    }
+    size_t rounded = (size / allocation->granularity + (size % allocation->granularity != 0)) * allocation->granularity;
+    if (rounded <= allocation->committed)
+        return true;
+    // Existing kernels/graphs must finish before the page tables change.
+    if (!check_cu(cuCtxSynchronize_f()))
+        return false;
+    size_t size_to_map = rounded - allocation->committed;
+    size_t offset = allocation->committed;
+    CUdeviceptr ptr = allocation->ptr + offset;
+    // Allocate metadata before acquiring resources, so host OOM cannot leak a mapping.
+    try {
+        allocation->mappings.emplace_back(offset, size_to_map);
+    } catch (const std::bad_alloc&) {
+        wp::set_error_string("Failed to allocate CUDA virtual memory mapping metadata");
+        return false;
+    }
+    CUmemGenericAllocationHandle handle;
+    if (!check_cu(cuMemCreate_f(&handle, size_to_map, &allocation->prop, 0))) {
+        allocation->mappings.pop_back();
+        return false;
+    }
+    bool mapped = check_cu(cuMemMap_f(ptr, size_to_map, 0, handle, 0));
+    // The mapping retains its own reference to the physical allocation.
+    check_cu(cuMemRelease_f(handle));
+    if (!mapped) {
+        allocation->mappings.pop_back();
+        return false;
+    }
+    CUmemAccessDesc access = {};
+    access.location = allocation->prop.location;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (!check_cu(cuMemSetAccess_f(ptr, size_to_map, &access, 1))
+        || !check_cuda(cudaMemset(reinterpret_cast<void*>(ptr), 0, size_to_map)) || !check_cu(cuCtxSynchronize_f())) {
+        if (check_cu(cuMemUnmap_f(ptr, size_to_map)))
+            allocation->mappings.pop_back();
+        return false;
+    }
+    allocation->committed = rounded;
+    return true;
+}
+
+bool wp_virtual_memory_destroy(void* allocation_, bool defer)
+{
+    auto* allocation = static_cast<VirtualMemoryAllocation*>(allocation_);
+    if (!allocation)
+        return true;
+    ContextGuard guard(allocation->context);
+    if (defer
+        && (!g_captures.empty() || wp_cuda_stream_is_capturing(wp_cuda_context_get_stream(allocation->context)))) {
+        g_deferred_virtual_memory.push_back(allocation);
+        return true;
+    }
+    if (!virtual_memory_mutation_allowed(allocation->context) || !check_cu(cuCtxSynchronize_f()))
+        return false;
+    while (!allocation->mappings.empty()) {
+        auto mapping = allocation->mappings.back();
+        if (!check_cu(cuMemUnmap_f(allocation->ptr + mapping.first, mapping.second)))
+            return false;
+        allocation->mappings.pop_back();
+    }
+    if (!check_cu(cuMemAddressFree_f(allocation->ptr, allocation->reserved)))
+        return false;
+    delete allocation;
+    return true;
+}
+
+// Capture-only suballocation from caller-owned, already committed memory.
+// The Python graph and array allocator retain the owner beyond scope exit.
+struct CaptureScratchArena {
+    void* context;
+    uintptr_t base;
+    size_t capacity;
+    size_t used = 0;
+    bool exhausted = false;
+    bool entered = false;
+    CaptureScratchArena* previous = nullptr;
+};
+
+static thread_local CaptureScratchArena* g_capture_scratch_active = nullptr;
+static std::mutex g_capture_scratch_mutex;
+static std::vector<CaptureScratchArena*> g_capture_scratch_arenas;
+static std::atomic<size_t> g_capture_scratch_count { 0 };
+
+static bool is_capture_scratch_pointer(void* ptr)
+{
+    if (!ptr || !g_capture_scratch_count.load())
+        return false;
+    uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+    std::lock_guard<std::mutex> lock(g_capture_scratch_mutex);
+    for (const auto* arena : g_capture_scratch_arenas) {
+        if (address >= arena->base && address - arena->base < arena->capacity)
+            return true;
+    }
+    return false;
+}
+
+void* wp_capture_scratch_create(void* context, void* ptr, size_t capacity)
+{
+    uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
+    if (!ptr || !capacity || base % 256 || capacity > UINTPTR_MAX - base) {
+        wp::set_error_string("Capture scratch requires an aligned nonempty device buffer");
+        return nullptr;
+    }
+    auto* arena = new (std::nothrow) CaptureScratchArena;
+    if (!arena)
+        return nullptr;
+    arena->context = context;
+    arena->base = base;
+    arena->capacity = capacity;
+    std::lock_guard<std::mutex> lock(g_capture_scratch_mutex);
+    try {
+        g_capture_scratch_arenas.push_back(arena);
+    } catch (const std::bad_alloc&) {
+        delete arena;
+        return nullptr;
+    }
+    ++g_capture_scratch_count;
+    return arena;
+}
+
+bool wp_capture_scratch_destroy(void* arena_)
+{
+    auto* arena = static_cast<CaptureScratchArena*>(arena_);
+    if (arena->entered) {
+        wp::set_error_string("Cannot destroy an active capture scratch scope");
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_capture_scratch_mutex);
+    auto it = std::find(g_capture_scratch_arenas.begin(), g_capture_scratch_arenas.end(), arena);
+    if (it != g_capture_scratch_arenas.end()) {
+        g_capture_scratch_arenas.erase(it);
+        --g_capture_scratch_count;
+    }
+    delete arena;
+    return true;
+}
+
+bool wp_capture_scratch_begin(void* arena_)
+{
+    auto* arena = static_cast<CaptureScratchArena*>(arena_);
+    if (arena->entered) {
+        wp::set_error_string("Capture scratch scopes are not reentrant");
+        return false;
+    }
+    arena->previous = g_capture_scratch_active;
+    arena->entered = true;
+    g_capture_scratch_active = arena;
+    return true;
+}
+
+bool wp_capture_scratch_end(void* arena_)
+{
+    auto* arena = static_cast<CaptureScratchArena*>(arena_);
+    if (g_capture_scratch_active != arena) {
+        wp::set_error_string("Capture scratch scopes must exit in stack order");
+        return false;
+    }
+    g_capture_scratch_active = arena->previous;
+    arena->previous = nullptr;
+    arena->entered = false;
+    return true;
+}
+
+void* wp_capture_scratch_alloc(void* arena_, size_t size)
+{
+    auto* arena = static_cast<CaptureScratchArena*>(arena_);
+    ContextGuard guard(arena->context);
+    if (g_capture_scratch_active != arena || !wp_cuda_stream_is_capturing(wp_cuda_context_get_stream(arena->context))) {
+        wp::set_error_string("Capture scratch can only allocate during capture in its active scope");
+        return nullptr;
+    }
+    size_t padding = (256 - arena->used % 256) % 256;
+    if (padding > arena->capacity - arena->used || size > arena->capacity - arena->used - padding) {
+        arena->exhausted = true;
+        wp::set_error_string("Capture scratch arena is exhausted");
+        return nullptr;
+    }
+    size_t offset = arena->used + padding;
+    arena->used = offset + size;
+    return reinterpret_cast<void*>(arena->base + offset);
+}
+
+size_t wp_capture_scratch_used(void* arena) { return static_cast<CaptureScratchArena*>(arena)->used; }
+bool wp_capture_scratch_exhausted(void* arena) { return static_cast<CaptureScratchArena*>(arena)->exhausted; }
+
+bool wp_capture_scratch_rewind(void* arena_)
+{
+    auto* arena = static_cast<CaptureScratchArena*>(arena_);
+    ContextGuard guard(arena->context);
+    if (g_capture_scratch_active != arena || !wp_cuda_stream_is_capturing(wp_cuda_context_get_stream(arena->context))) {
+        wp::set_error_string("Capture scratch rewind requires capture in its active scope");
+        return false;
+    }
+    arena->used = 0;
+    return true;
+}
+
+static bool capture_scratch_applies(void* context, void* stream)
+{
+    return g_capture_scratch_active && g_capture_scratch_active->context == context
+        && wp_cuda_stream_is_capturing(stream);
+}
+
 void* wp_alloc_device(void* context, size_t s, const char* tag)
 {
     int ordinal = wp_cuda_context_get_device_ordinal(context);
@@ -761,6 +1055,8 @@ void* wp_alloc_device(void* context, size_t s, const char* tag)
 
 void wp_free_device(void* context, void* ptr)
 {
+    if (is_capture_scratch_pointer(ptr))
+        return;
     int ordinal = wp_cuda_context_get_device_ordinal(context);
 
     // use stream-ordered allocator if available
@@ -773,6 +1069,8 @@ void wp_free_device(void* context, void* ptr)
 void* wp_alloc_device_default(void* context, size_t s, const char* tag)
 {
     ContextGuard guard(context);
+    if (capture_scratch_applies(get_current_context(), wp_cuda_stream_get_current()))
+        return wp_capture_scratch_alloc(g_capture_scratch_active, s);
 
     void* ptr = NULL;
     check_cuda(cudaMalloc(&ptr, s));
@@ -784,6 +1082,8 @@ void* wp_alloc_device_default(void* context, size_t s, const char* tag)
 
 void wp_free_device_default(void* context, void* ptr)
 {
+    if (is_capture_scratch_pointer(ptr))
+        return;
     if (g_alloc_tracker.enabled && ptr)
         g_alloc_tracker.record_free(ptr);
 
@@ -809,6 +1109,9 @@ void* wp_alloc_device_async(void* context, size_t s, void* stream_, const char* 
         stream = static_cast<CUstream>(stream_);
     else
         stream = get_current_stream(context);
+
+    if (capture_scratch_applies(get_current_context(), stream))
+        return wp_capture_scratch_alloc(g_capture_scratch_active, s);
 
     void* ptr = NULL;
     check_cuda(cudaMallocAsync(&ptr, s, stream));
@@ -888,6 +1191,8 @@ void* wp_alloc_device_managed(void* context, size_t s, const char* tag)
 
 void wp_free_device_async(void* context, void* ptr, void** dbg_node_ret)
 {
+    if (is_capture_scratch_pointer(ptr))
+        return;
     if (g_alloc_tracker.enabled && ptr)
         g_alloc_tracker.record_free(ptr);
 

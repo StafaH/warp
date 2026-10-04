@@ -1038,6 +1038,19 @@ void* wp_alloc_device_async(void* context, size_t s, void* stream, const char* t
 
 void* wp_alloc_device_managed(void* context, size_t s, const char* tag) { return NULL; }
 
+void* wp_virtual_memory_create(void*, size_t, void**, size_t*, size_t*) { return NULL; }
+bool wp_virtual_memory_commit(void*, size_t) { return false; }
+bool wp_virtual_memory_destroy(void*, bool) { return false; }
+void* wp_capture_scratch_create(void*, void*, size_t) { return nullptr; }
+bool wp_capture_scratch_destroy(void*) { return false; }
+bool wp_capture_scratch_begin(void*) { return false; }
+bool wp_capture_scratch_end(void*) { return false; }
+void* wp_capture_scratch_alloc(void*, size_t) { return nullptr; }
+size_t wp_capture_scratch_used(void*) { return 0; }
+bool wp_capture_scratch_exhausted(void*) { return false; }
+bool wp_capture_scratch_rewind(void*) { return false; }
+
+
 void wp_free_device(void* context, void* ptr) { }
 
 void wp_free_device_default(void* context, void* ptr) { }
